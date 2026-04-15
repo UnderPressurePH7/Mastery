@@ -21,7 +21,7 @@ package com.under_pressure.mastery
         private static const ROW_HEIGHT:int = 22;
         private static const ROW_GAP:int = 2;
         private static const COL_COUNT:int = 4;
-        private static const COL_GAP:int = 26;
+        private static const COL_GAP:int = 18;
         private static const ICON_W:int = 24;
         private static const ICON_H:int = 22;
         private static const ICON_GAP:int = 4;
