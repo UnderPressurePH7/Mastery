@@ -11,7 +11,6 @@ package com.under_pressure.mastery
         private var _panel:MasteryPanelComponent = null;
 
         public var py_onDragEnd:Function = null;
-        public var py_onCollapseToggle:Function = null;
         public var py_onPanelReady:Function = null;
 
         private var _configDone:Boolean = false;
@@ -70,7 +69,6 @@ package com.under_pressure.mastery
             _destroyPanel();
             _pendingCalls = [];
             py_onDragEnd = null;
-            py_onCollapseToggle = null;
             py_onPanelReady = null;
             _configDone = false;
             super.onDispose();
@@ -102,7 +100,6 @@ package com.under_pressure.mastery
             if (_panel) return;
             _panel = new MasteryPanelComponent();
             _panel.addEventListener(MasteryPanelEvent.OFFSET_CHANGED, _onOffsetChanged);
-            _panel.addEventListener(MasteryPanelEvent.COLLAPSE_TOGGLE, _onCollapseToggle);
             addChild(_panel);
         }
 
@@ -111,7 +108,6 @@ package com.under_pressure.mastery
             if (_panel)
             {
                 _panel.removeEventListener(MasteryPanelEvent.OFFSET_CHANGED, _onOffsetChanged);
-                _panel.removeEventListener(MasteryPanelEvent.COLLAPSE_TOGGLE, _onCollapseToggle);
                 _panel.dispose();
                 if (_panel.parent) _panel.parent.removeChild(_panel);
                 _panel = null;
@@ -134,11 +130,6 @@ package com.under_pressure.mastery
         private function _onOffsetChanged(event:MasteryPanelEvent):void
         {
             if (py_onDragEnd != null) py_onDragEnd(event.data);
-        }
-
-        private function _onCollapseToggle(event:MasteryPanelEvent):void
-        {
-            if (py_onCollapseToggle != null) py_onCollapseToggle(event.data);
         }
 
         public function as_setMasteryData(third:int, second:int, first:int, ace:int):void
@@ -199,16 +190,6 @@ package com.under_pressure.mastery
                 return;
             }
             if (_panel) _panel.setPositionOffset(offset);
-        }
-
-        public function as_setCollapsed(value:Boolean):void
-        {
-            if (!_configDone)
-            {
-                _pendingCalls.push({fn: this.as_setCollapsed, args: [value]});
-                return;
-            }
-            if (_panel) _panel.setCollapsedState(value);
         }
 
         public function as_setLocalization(data:Object):void

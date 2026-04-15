@@ -21,7 +21,7 @@ package com.under_pressure.mastery
         private static const ROW_HEIGHT:int = 22;
         private static const ROW_GAP:int = 2;
         private static const COL_COUNT:int = 4;
-        private static const COL_GAP:int = 10;
+        private static const COL_GAP:int = 26;
         private static const ICON_W:int = 24;
         private static const ICON_H:int = 22;
         private static const ICON_GAP:int = 4;
@@ -64,7 +64,6 @@ package com.under_pressure.mastery
         private var _matrix:Matrix;
 
         private var _disposed:Boolean = false;
-        private var _collapsed:Boolean = false;
         private var _offset:Array = [100, 100];
 
         private var _clickPoint:Point;
@@ -103,9 +102,9 @@ package com.under_pressure.mastery
             addChild(_background);
 
             _xpIcon = _createRowFields(COL_COUNT, TextFieldAutoSize.LEFT, FONT_SIZE_VALUE);
-            _xpValue = _createRowFields(COL_COUNT, TextFieldAutoSize.RIGHT, FONT_SIZE_VALUE);
+            _xpValue = _createRowFields(COL_COUNT, TextFieldAutoSize.LEFT, FONT_SIZE_VALUE);
             _moePercent = _createRowFields(COL_COUNT, TextFieldAutoSize.LEFT, FONT_SIZE_PERCENT);
-            _moeValue = _createRowFields(COL_COUNT, TextFieldAutoSize.RIGHT, FONT_SIZE_VALUE);
+            _moeValue = _createRowFields(COL_COUNT, TextFieldAutoSize.LEFT, FONT_SIZE_VALUE);
 
             _createDragHit();
             _setupDragListeners();
@@ -165,12 +164,6 @@ package com.under_pressure.mastery
             _syncPosition();
         }
 
-        public function setCollapsedState(value:Boolean):void
-        {
-            if (_disposed) return;
-            _collapsed = value;
-        }
-
         public function setLocalization(data:Object):void
         {
             if (_disposed || !data) return;
@@ -204,7 +197,7 @@ package com.under_pressure.mastery
             {
                 var colX:int = PAD_H + i * (COL_WIDTH + COL_GAP);
                 var iconX:int = colX;
-                var valueRight:int = colX + COL_WIDTH;
+                var valueX:int = iconX + ICON_W + ICON_GAP;
 
                 var iconTf:TextField = _xpIcon[i] as TextField;
                 iconTf.htmlText = "<img src='" + ICONS[i] + "' width='" + ICON_W + "' height='" + ICON_H + "'/>";
@@ -214,7 +207,7 @@ package com.under_pressure.mastery
                 var xpTf:TextField = _xpValue[i] as TextField;
                 var xpValColor:uint = _hasXp ? COLOR_VALUE : COLOR_DIM;
                 xpTf.htmlText = _fmt(_xpCellText(i), FONT_SIZE_VALUE, xpValColor);
-                xpTf.x = valueRight - xpTf.width;
+                xpTf.x = valueX;
                 xpTf.y = rowTopY + 1;
 
                 var pctTf:TextField = _moePercent[i] as TextField;
@@ -225,7 +218,7 @@ package com.under_pressure.mastery
                 var moeTf:TextField = _moeValue[i] as TextField;
                 var moeValColor:uint = _hasMoe ? COLOR_VALUE : COLOR_DIM;
                 moeTf.htmlText = _fmt(_moeCellText(i), FONT_SIZE_VALUE, moeValColor);
-                moeTf.x = valueRight - moeTf.width;
+                moeTf.x = valueX;
                 moeTf.y = rowBotY + 1;
             }
 

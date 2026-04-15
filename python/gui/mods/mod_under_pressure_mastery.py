@@ -126,9 +126,6 @@ def _findTankRecord(container, tankID):
     for key in (tankID, str(tankID), unicode(tankID)):
         if key in container:
             return container.get(key)
-    distribution = container.get('distribution')
-    if isinstance(distribution, dict):
-        return _findTankRecord(distribution, tankID)
     return None
 
 
@@ -173,10 +170,6 @@ class MasteryPanelInjectorView(View):
         if MasteryPanelInjectorView._g_controller:
             MasteryPanelInjectorView._g_controller._onDragEnd(offset)
 
-    def py_onCollapseToggle(self, collapsed):
-        if MasteryPanelInjectorView._g_controller:
-            MasteryPanelInjectorView._g_controller._onCollapseToggle(collapsed)
-
     def py_onPanelReady(self):
         if MasteryPanelInjectorView._g_controller:
             MasteryPanelInjectorView._g_controller._onPanelReady()
@@ -206,7 +199,6 @@ class MasteryController(object):
         self._visibleByData = False
         self._scaleBound = False
         self._position = [100, 100]
-        self._collapsed = False
         self._xpCache = {}
         self._moeCache = {}
         self._pendingXp = set()
@@ -230,8 +222,14 @@ class MasteryController(object):
         except Exception:
             self._scaleBound = False
         lsm = getLobbyStateMachine()
-        lsm.onVisibleRouteChanged += self._onVisibleRouteChanged
-        self._hangarVisible = self._isHangarState(lsm.visibleRouteInfo.state)
+        if lsm is not None:
+            lsm.onVisibleRouteChanged += self._onVisibleRouteChanged
+            try:
+                self._hangarVisible = self._isHangarState(lsm.visibleRouteInfo.state)
+            except Exception:
+                self._hangarVisible = False
+        else:
+            self._hangarVisible = False
         if self._hangarVisible:
             self._injectFlash()
         logger.debug('enabled, hangarVisible=%s', self._hangarVisible)
@@ -325,7 +323,7 @@ class MasteryController(object):
 
     def _onPanelReady(self):
         self._panelReady = True
-        logger.debug('panel ready pos=%s collapsed=%s', self._position, self._collapsed)
+        logger.debug('panel ready pos=%s', self._position)
         if self._injectorView:
             try:
                 self._injectorView.flashObject.as_setLocalization({
@@ -333,7 +331,6 @@ class MasteryController(object):
                     'noData':  _tr('noData',  u'N/A'),
                 })
                 self._injectorView.flashObject.as_setPosition(self._position)
-                self._injectorView.flashObject.as_setCollapsed(self._collapsed)
                 self._injectorView.flashObject.as_setVisible(self._hangarVisible)
             except Exception:
                 logger.exception('panel init calls failed')
@@ -363,10 +360,9 @@ class MasteryController(object):
                             self._position = [int(pos[0]), int(pos[1])]
                         except (TypeError, ValueError):
                             pass
-                    self._collapsed = bool(cached.get('collapsed', self._collapsed))
-                    logger.debug('cache loaded: %d xp, %d moe records, pos=%s collapsed=%s',
+                    logger.debug('cache loaded: %d xp, %d moe records, pos=%s',
                                  len(self._xpCache), len(self._moeCache),
-                                 self._position, self._collapsed)
+                                 self._position)
                 else:
                     logger.debug('cache: version mismatch (got %s, want %s), discarding',
                                  version, _CACHE_VERSION)
@@ -390,7 +386,6 @@ class MasteryController(object):
                 'xp': self._xpCache,
                 'moe': self._moeCache,
                 'position': list(self._position),
-                'collapsed': bool(self._collapsed),
             }
             raw = zlib.compress(cPickle.dumps((payload, _CACHE_VERSION), cPickle.HIGHEST_PROTOCOL), 1)
             with open(_CACHE_FILE, 'wb') as fh:
@@ -474,7 +469,7 @@ class MasteryController(object):
             BigWorld.fetchURL(
                 url,
                 lambda response, t=tankID, d=distribution: self._onApiResponse(t, d, response),
-                (), _API_TIMEOUT, 'GET', '',
+                None, _API_TIMEOUT, 'GET', None,
             )
         except Exception:
             logger.exception('fetchURL failed tankID=%s dist=%s', tankID, distribution)
@@ -521,12 +516,6 @@ class MasteryController(object):
             logger.debug('drag end pos=%s', self._position)
         except Exception:
             logger.exception('drag save failed')
-
-    def _onCollapseToggle(self, collapsed):
-        self._collapsed = bool(collapsed)
-        self._scheduleSaveCache()
-        logger.debug('collapsed=%s', self._collapsed)
-
 
 class _Mod(object):
 
