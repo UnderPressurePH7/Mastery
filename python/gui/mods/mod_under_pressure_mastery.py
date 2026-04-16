@@ -29,7 +29,7 @@ _L10N_DIR = 'mods/under_pressure.mastery'
 _L10N_FALLBACK = 'en'
 _l10n = {}
 
-_API_APP_ID = '8f04db08e54ff45dbd7d4b7e7de0b76b'
+_API_APP_ID = 'bce57ac20af6b67b08be09fd66847ed9'
 _API_URL_TEMPLATE = (
     'https://api.worldoftanks.%s/wot/tanks/mastery/'
     '?application_id=' + _API_APP_ID +
@@ -144,7 +144,13 @@ def _extractPercentile(source, percentile):
 def _parseApiResponse(payload, tankID, mapping):
     if not isinstance(payload, dict):
         return None
-    record = _findTankRecord(payload.get('data'), tankID)
+    data = payload.get('data')
+    if not isinstance(data, dict):
+        return None
+    distribution = data.get('distribution')
+    if not isinstance(distribution, dict):
+        distribution = data
+    record = _findTankRecord(distribution, tankID)
     if not isinstance(record, dict):
         return None
     result = {}
