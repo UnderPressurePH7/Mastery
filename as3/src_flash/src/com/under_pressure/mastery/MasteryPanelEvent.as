@@ -4,7 +4,8 @@ package com.under_pressure.mastery
 
     public class MasteryPanelEvent extends Event
     {
-        public static const OFFSET_CHANGED:String = "MasteryPanel.offsetChanged";
+        public static const OFFSET_CHANGED:String    = "MasteryPanel.offsetChanged";
+        public static const VIEW_MODE_CHANGED:String = "MasteryPanel.viewModeChanged";
 
         public var data:*;
 

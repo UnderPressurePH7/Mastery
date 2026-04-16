@@ -20,7 +20,7 @@ from frameworks.wulf import WindowLayer
 logger = logging.getLogger('under_pressure.mastery')
 logger.setLevel(logging.DEBUG if os.path.isfile('.debug_mods') else logging.ERROR)
 
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 
 _LINKAGE = 'MasteryPanelInjector'
 _SWF = 'MasteryPanel.swf'
@@ -29,7 +29,7 @@ _L10N_DIR = 'mods/under_pressure.mastery'
 _L10N_FALLBACK = 'en'
 _l10n = {}
 
-_API_APP_ID = 'bce57ac20af6b67b08be09fd66847ed9'
+_API_APP_ID = '8f04db08e54ff45dbd7d4b7e7de0b76b'
 _API_URL_TEMPLATE = (
     'https://api.worldoftanks.%s/wot/tanks/mastery/'
     '?application_id=' + _API_APP_ID +
@@ -53,6 +53,8 @@ _MOE_PERCENTILE_TO_KEY = (
 _INJECT_RETRY_DELAY = 0.5
 _INJECT_MAX_ATTEMPTS = 30
 _API_TIMEOUT = 5.0
+_MAX_HISTORY = 10
+_DEFAULT_VIEW_MODE = 0
 
 try:
     _prefsFilePath = BigWorld.wg_getPreferencesFilePath()
@@ -61,7 +63,7 @@ except AttributeError:
 
 _CACHE_DIR = os.path.normpath(os.path.join(os.path.dirname(_prefsFilePath), 'mods', 'mastery'))
 _CACHE_FILE = os.path.join(_CACHE_DIR, 'cache.dat')
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _CACHE_SAVE_DEBOUNCE = 3.0
 
 
@@ -153,6 +155,43 @@ def _parseApiResponse(payload, tankID, mapping):
     return result
 
 
+def _safeFloat(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _readMarkPercent(vehicle):
+    """Try to read current MOE % from vehicle object. Returns float 0-100 or None."""
+    if vehicle is None:
+        return None
+    candidates = []
+    for attr in ('marksOnGun', 'damageRating', 'movingAvgDamage'):
+        if hasattr(vehicle, attr):
+            candidates.append(getattr(vehicle, attr))
+    dossier = getattr(vehicle, 'publicInfo', None)
+    if dossier is not None:
+        for attr in ('marksOnGun', 'damageRating'):
+            if hasattr(dossier, attr):
+                candidates.append(getattr(dossier, attr))
+    descr = getattr(vehicle, 'descriptor', None)
+    if descr is not None:
+        for attr in ('marksOnGun', 'damageRating'):
+            if hasattr(descr, attr):
+                candidates.append(getattr(descr, attr))
+
+    for value in candidates:
+        number = _safeFloat(value)
+        if number is None:
+            continue
+        if 0.0 <= number <= 100.0:
+            return round(number, 2)
+        if 0.0 <= number <= 1.0:
+            return round(number * 100.0, 2)
+    return None
+
+
 class MasteryPanelInjectorView(View):
     _g_controller = None
 
@@ -174,6 +213,10 @@ class MasteryPanelInjectorView(View):
         if MasteryPanelInjectorView._g_controller:
             MasteryPanelInjectorView._g_controller._onPanelReady()
 
+    def py_onViewModeChanged(self, mode):
+        if MasteryPanelInjectorView._g_controller:
+            MasteryPanelInjectorView._g_controller._onViewModeChanged(mode)
+
 
 def _registerFlash():
     g_entitiesFactories.addSettings(ViewSettings(
@@ -192,18 +235,21 @@ def _unregisterFlash():
 class MasteryController(object):
 
     def __init__(self):
-        self._injectorView = None
-        self._panelReady = False
-        self._enabled = False
+        self._injectorView  = None
+        self._panelReady    = False
+        self._enabled       = False
         self._hangarVisible = False
         self._visibleByData = False
-        self._scaleBound = False
-        self._position = [100, 100]
-        self._xpCache = {}
-        self._moeCache = {}
-        self._pendingXp = set()
-        self._pendingMoe = set()
-        self._saveRev = 0
+        self._scaleBound    = False
+        self._position      = [100, 100]
+        self._viewMode      = _DEFAULT_VIEW_MODE
+        self._xpCache       = {}
+        self._moeCache      = {}
+        self._pendingXp     = set()
+        self._pendingMoe    = set()
+        self._markHistory   = {}
+        self._lastKnownMark = {}
+        self._saveRev       = 0
         self._saveCallbackId = None
         self._loadCache()
 
@@ -211,8 +257,8 @@ class MasteryController(object):
         if self._enabled:
             return
         self._enabled = True
-        self._injectorView = None
-        self._panelReady = False
+        self._injectorView  = None
+        self._panelReady    = False
         self._visibleByData = False
         MasteryPanelInjectorView._g_controller = self
         g_currentVehicle.onChanged += self._onVehicleChanged
@@ -255,8 +301,8 @@ class MasteryController(object):
             except Exception:
                 pass
         MasteryPanelInjectorView._g_controller = None
-        self._injectorView = None
-        self._panelReady = False
+        self._injectorView  = None
+        self._panelReady    = False
         self._hangarVisible = False
         self._visibleByData = False
         logger.debug('disabled')
@@ -286,6 +332,8 @@ class MasteryController(object):
         self._hangarVisible = self._isHangarState(routeInfo.state)
         if self._hangarVisible and not self._panelReady and not self._injectorView:
             self._injectFlash()
+        if self._hangarVisible:
+            self._captureCurrentMarkSample()
         self._updateVisibility()
 
     def _updateVisibility(self):
@@ -298,7 +346,26 @@ class MasteryController(object):
             logger.exception('as_setVisible failed')
 
     def _onVehicleChanged(self):
+        self._captureCurrentMarkSample(forceAppend=False)
         self._refresh()
+
+    def _captureCurrentMarkSample(self, forceAppend=False):
+        if not g_currentVehicle.isPresent():
+            return
+        vehicle = g_currentVehicle.item
+        tankID = getattr(vehicle, 'intCD', None)
+        if tankID is None:
+            return
+        mark = _readMarkPercent(vehicle)
+        if mark is None:
+            return
+        history = self._markHistory.setdefault(tankID, [])
+        last = history[-1] if history else None
+        if forceAppend or last is None or abs(float(last) - float(mark)) > 0.0001:
+            history.append(mark)
+            if len(history) > _MAX_HISTORY:
+                del history[:-_MAX_HISTORY]
+        self._lastKnownMark[tankID] = mark
 
     def _injectFlash(self, attempt=0):
         if not self._enabled:
@@ -319,11 +386,11 @@ class MasteryController(object):
 
     def _onInjectorDisposed(self):
         self._injectorView = None
-        self._panelReady = False
+        self._panelReady   = False
 
     def _onPanelReady(self):
         self._panelReady = True
-        logger.debug('panel ready pos=%s', self._position)
+        logger.debug('panel ready pos=%s mode=%s', self._position, self._viewMode)
         if self._injectorView:
             try:
                 self._injectorView.flashObject.as_setLocalization({
@@ -331,12 +398,21 @@ class MasteryController(object):
                     'noData':  _tr('noData',  u'N/A'),
                 })
                 self._injectorView.flashObject.as_setPosition(self._position)
+                self._injectorView.flashObject.as_setViewMode(int(self._viewMode))
                 self._injectorView.flashObject.as_setVisible(self._hangarVisible)
             except Exception:
                 logger.exception('panel init calls failed')
         self._refresh()
 
-    _EMPTY_XP = {'thirdClass': 0, 'secondClass': 0, 'firstClass': 0, 'aceTanker': 0}
+    def _onViewModeChanged(self, mode):
+        try:
+            self._viewMode = int(mode)
+            self._scheduleSaveCache()
+            logger.debug('view mode changed: %s', self._viewMode)
+        except Exception:
+            self._viewMode = _DEFAULT_VIEW_MODE
+
+    _EMPTY_XP  = {'thirdClass': 0, 'secondClass': 0, 'firstClass': 0, 'aceTanker': 0}
     _EMPTY_MOE = {'p65': 0, 'p85': 0, 'p95': 0, 'p100': 0}
 
     def _loadCache(self):
@@ -352,7 +428,7 @@ class MasteryController(object):
                 raw = fh.read()
                 cached, version = cPickle.loads(zlib.decompress(raw))
                 if version == _CACHE_VERSION and isinstance(cached, dict):
-                    self._xpCache = cached.get('xp', {}) or {}
+                    self._xpCache  = cached.get('xp',  {}) or {}
                     self._moeCache = cached.get('moe', {}) or {}
                     pos = cached.get('position')
                     if isinstance(pos, (list, tuple)) and len(pos) >= 2:
@@ -360,9 +436,15 @@ class MasteryController(object):
                             self._position = [int(pos[0]), int(pos[1])]
                         except (TypeError, ValueError):
                             pass
-                    logger.debug('cache loaded: %d xp, %d moe records, pos=%s',
+                    try:
+                        self._viewMode = int(cached.get('viewMode', _DEFAULT_VIEW_MODE))
+                    except (TypeError, ValueError):
+                        self._viewMode = _DEFAULT_VIEW_MODE
+                    self._markHistory   = cached.get('markHistory',   {}) or {}
+                    self._lastKnownMark = cached.get('lastKnownMark', {}) or {}
+                    logger.debug('cache loaded: %d xp, %d moe, mode=%s, pos=%s',
                                  len(self._xpCache), len(self._moeCache),
-                                 self._position)
+                                 self._viewMode, self._position)
                 else:
                     logger.debug('cache: version mismatch (got %s, want %s), discarding',
                                  version, _CACHE_VERSION)
@@ -383,15 +465,18 @@ class MasteryController(object):
             if not os.path.isdir(_CACHE_DIR):
                 os.makedirs(_CACHE_DIR)
             payload = {
-                'xp': self._xpCache,
-                'moe': self._moeCache,
-                'position': list(self._position),
+                'xp':            self._xpCache,
+                'moe':           self._moeCache,
+                'position':      list(self._position),
+                'viewMode':      self._viewMode,
+                'markHistory':   self._markHistory,
+                'lastKnownMark': self._lastKnownMark,
             }
             raw = zlib.compress(cPickle.dumps((payload, _CACHE_VERSION), cPickle.HIGHEST_PROTOCOL), 1)
             with open(_CACHE_FILE, 'wb') as fh:
                 fh.write(raw)
-            logger.debug('cache saved: %d xp, %d moe records',
-                         len(self._xpCache), len(self._moeCache))
+            logger.debug('cache saved: %d xp, %d moe, mode=%s',
+                         len(self._xpCache), len(self._moeCache), self._viewMode)
         except Exception:
             logger.exception('cache: failed to save')
 
@@ -414,7 +499,7 @@ class MasteryController(object):
         self._visibleByData = True
         self._updateVisibility()
 
-        xp = self._xpCache.get(tankID)
+        xp  = self._xpCache.get(tankID)
         moe = self._moeCache.get(tankID)
         if xp is None and moe is None:
             try:
@@ -429,16 +514,17 @@ class MasteryController(object):
             self._pushMoe(moe)
         else:
             self._requestDistribution(tankID, 'damage')
+        self._pushHistory(tankID)
 
     def _pushMastery(self, xp):
         if not self._injectorView:
             return
         try:
             self._injectorView.flashObject.as_setMasteryData(
-                int(xp.get('thirdClass') or 0),
+                int(xp.get('thirdClass')  or 0),
                 int(xp.get('secondClass') or 0),
-                int(xp.get('firstClass') or 0),
-                int(xp.get('aceTanker') or 0),
+                int(xp.get('firstClass')  or 0),
+                int(xp.get('aceTanker')   or 0),
             )
         except Exception:
             logger.exception('as_setMasteryData failed')
@@ -456,14 +542,27 @@ class MasteryController(object):
         except Exception:
             logger.exception('as_setMoeData failed')
 
+    def _pushHistory(self, tankID):
+        if not self._injectorView:
+            return
+        values  = self._markHistory.get(tankID, [])[-_MAX_HISTORY:]
+        current = self._lastKnownMark.get(tankID)
+        try:
+            self._injectorView.flashObject.as_setBattleHistory(
+                values,
+                float(current if current is not None else 0.0)
+            )
+        except Exception:
+            logger.exception('as_setBattleHistory failed')
+
     def _requestDistribution(self, tankID, distribution):
-        isXp = (distribution == 'xp')
+        isXp    = (distribution == 'xp')
         pending = self._pendingXp if isXp else self._pendingMoe
         if tankID in pending:
             return
         pending.add(tankID)
         query = _XP_PERCENTILES_QUERY if isXp else _MOE_PERCENTILES_QUERY
-        url = _buildApiUrl(tankID, distribution, query)
+        url   = _buildApiUrl(tankID, distribution, query)
         logger.debug('api request tankID=%s dist=%s url=%s', tankID, distribution, url)
         try:
             BigWorld.fetchURL(
@@ -480,7 +579,7 @@ class MasteryController(object):
                 self._pushMoe(self._EMPTY_MOE)
 
     def _onApiResponse(self, tankID, distribution, response):
-        isXp = (distribution == 'xp')
+        isXp    = (distribution == 'xp')
         mapping = _PERCENTILE_TO_KEY if isXp else _MOE_PERCENTILE_TO_KEY
         pending = self._pendingXp if isXp else self._pendingMoe
         pending.discard(tankID)
@@ -502,7 +601,7 @@ class MasteryController(object):
                 (self._pushMastery if isXp else self._pushMoe)(empty)
             return
         if isXp:
-            self._xpCache[tankID] = parsed
+            self._xpCache[tankID]  = parsed
         else:
             self._moeCache[tankID] = parsed
         self._scheduleSaveCache()
@@ -517,6 +616,7 @@ class MasteryController(object):
         except Exception:
             logger.exception('drag save failed')
 
+
 class _Mod(object):
 
     def __init__(self):
@@ -525,20 +625,20 @@ class _Mod(object):
     def init(self):
         _loadLocalization()
         _registerFlash()
-        g_playerEvents.onAccountShowGUI += self._onAccountShowGUI
-        g_playerEvents.onAvatarBecomePlayer += self._onAvatarBecomePlayer
+        g_playerEvents.onAccountShowGUI        += self._onAccountShowGUI
+        g_playerEvents.onAvatarBecomePlayer    += self._onAvatarBecomePlayer
         g_playerEvents.onAccountBecomeNonPlayer += self._onAccountBecomeNonPlayer
-        g_playerEvents.onDisconnected += self._onDisconnected
+        g_playerEvents.onDisconnected          += self._onDisconnected
         if self._isAccount():
             self._ctrl.enable()
         logger.debug('initialized v%s', __version__)
 
     def fini(self):
         try:
-            g_playerEvents.onAccountShowGUI -= self._onAccountShowGUI
-            g_playerEvents.onAvatarBecomePlayer -= self._onAvatarBecomePlayer
+            g_playerEvents.onAccountShowGUI        -= self._onAccountShowGUI
+            g_playerEvents.onAvatarBecomePlayer    -= self._onAvatarBecomePlayer
             g_playerEvents.onAccountBecomeNonPlayer -= self._onAccountBecomeNonPlayer
-            g_playerEvents.onDisconnected -= self._onDisconnected
+            g_playerEvents.onDisconnected          -= self._onDisconnected
         except Exception:
             pass
         self._ctrl.disable()
