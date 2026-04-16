@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 import cPickle
+import functools
 import json
 import logging
 import os
+import time
 import zlib
+from collections import deque
 
 import BigWorld
 import constants
@@ -17,10 +20,45 @@ from gui.Scaleform.lobby_entry import getLobbyStateMachine
 from gui.shared.personality import ServicesLocator
 from frameworks.wulf import WindowLayer
 
+try:
+    from messenger.proto.events import g_messengerEvents
+except ImportError:
+    g_messengerEvents = None
+
+try:
+    from messenger.formatters.service_channel import SYS_MESSAGE_TYPE
+except ImportError:
+    SYS_MESSAGE_TYPE = None
+
+try:
+    from gui.shared import g_eventBus
+except ImportError:
+    g_eventBus = None
+
+try:
+    from gui.shared.events import GUICommonEvent
+except ImportError:
+    GUICommonEvent = None
+
+try:
+    from helpers import dependency
+except ImportError:
+    dependency = None
+
+try:
+    from skeletons.gui.impl import IGuiLoader
+except ImportError:
+    IGuiLoader = None
+
+try:
+    from frameworks.wulf import WindowStatus
+except ImportError:
+    WindowStatus = None
+
 logger = logging.getLogger('under_pressure.mastery')
 logger.setLevel(logging.DEBUG if os.path.isfile('.debug_mods') else logging.ERROR)
 
-__version__ = '0.0.2'
+__version__ = '0.0.5'
 
 _LINKAGE = 'MasteryPanelInjector'
 _SWF = 'MasteryPanel.swf'
@@ -53,6 +91,8 @@ _MOE_PERCENTILE_TO_KEY = (
 _INJECT_RETRY_DELAY = 0.5
 _INJECT_MAX_ATTEMPTS = 30
 _API_TIMEOUT = 5.0
+_API_MAX_ATTEMPTS = 3
+_API_RETRY_BASE_DELAY = 2.0
 _MAX_HISTORY = 10
 _DEFAULT_VIEW_MODE = 0
 
@@ -63,7 +103,8 @@ except AttributeError:
 
 _CACHE_DIR = os.path.normpath(os.path.join(os.path.dirname(_prefsFilePath), 'mods', 'mastery'))
 _CACHE_FILE = os.path.join(_CACHE_DIR, 'cache.dat')
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
+_CACHE_TTL_SECONDS = 3 * 24 * 3600
 _CACHE_SAVE_DEBOUNCE = 3.0
 
 
@@ -169,7 +210,6 @@ def _safeFloat(value):
 
 
 def _readMarkPercent(vehicle):
-    """Try to read current MOE % from vehicle object. Returns float 0-100 or None."""
     if vehicle is None:
         return None
     candidates = []
@@ -196,6 +236,24 @@ def _readMarkPercent(vehicle):
         if 0.0 <= number <= 1.0:
             return round(number * 100.0, 2)
     return None
+
+
+def _readMarkForTankID(tankID):
+    if tankID is None:
+        return None
+    try:
+        items = ServicesLocator.itemsCache.items
+    except Exception:
+        return None
+    if items is None:
+        return None
+    try:
+        vehicle = items.getItemByCD(int(tankID))
+    except Exception:
+        return None
+    if vehicle is None:
+        return None
+    return _readMarkPercent(vehicle)
 
 
 class MasteryPanelInjectorView(View):
@@ -246,11 +304,14 @@ class MasteryController(object):
         self._enabled       = False
         self._hangarVisible = False
         self._visibleByData = False
+        self._modalOpen     = False
         self._scaleBound    = False
         self._position      = [100, 100]
         self._viewMode      = _DEFAULT_VIEW_MODE
         self._xpCache       = {}
         self._moeCache      = {}
+        self._xpCacheTs     = {}
+        self._moeCacheTs    = {}
         self._pendingXp     = set()
         self._pendingMoe    = set()
         self._markHistory   = {}
@@ -311,6 +372,7 @@ class MasteryController(object):
         self._panelReady    = False
         self._hangarVisible = False
         self._visibleByData = False
+        self._modalOpen     = False
         logger.debug('disabled')
 
     def _onScaleChanged(self, scale):
@@ -345,11 +407,19 @@ class MasteryController(object):
     def _updateVisibility(self):
         if not (self._panelReady and self._injectorView):
             return
-        visible = bool(self._hangarVisible and self._visibleByData)
+        visible = bool(self._hangarVisible and self._visibleByData and not self._modalOpen)
         try:
             self._injectorView.flashObject.as_setVisible(visible)
         except Exception:
             logger.exception('as_setVisible failed')
+
+    def _onModalChanged(self, isModalOpen):
+        newState = bool(isModalOpen)
+        if self._modalOpen == newState:
+            return
+        self._modalOpen = newState
+        logger.debug('modal state -> %s', self._modalOpen)
+        self._updateVisibility()
 
     def _onVehicleChanged(self):
         self._captureCurrentMarkSample(forceAppend=False)
@@ -372,6 +442,28 @@ class MasteryController(object):
             if len(history) > _MAX_HISTORY:
                 del history[:-_MAX_HISTORY]
         self._lastKnownMark[tankID] = mark
+
+    def _onBattleProcessed(self, tankID, moe):
+        try:
+            value = float(moe)
+        except (TypeError, ValueError):
+            return
+        history = self._markHistory.setdefault(tankID, [])
+        last = history[-1] if history else None
+        appended = False
+        if last is None or abs(float(last) - value) > 0.0001:
+            history.append(value)
+            if len(history) > _MAX_HISTORY:
+                del history[:-_MAX_HISTORY]
+            appended = True
+        self._lastKnownMark[tankID] = value
+        self._scheduleSaveCache()
+        logger.debug('battle: tankID=%s moe=%.2f appended=%s history=%d',
+                     tankID, value, appended, len(history))
+        if (self._enabled and self._panelReady
+                and g_currentVehicle.isPresent()
+                and getattr(g_currentVehicle.item, 'intCD', None) == tankID):
+            self._refresh()
 
     def _injectFlash(self, attempt=0):
         if not self._enabled:
@@ -405,7 +497,7 @@ class MasteryController(object):
                 })
                 self._injectorView.flashObject.as_setPosition(self._position)
                 self._injectorView.flashObject.as_setViewMode(int(self._viewMode))
-                self._injectorView.flashObject.as_setVisible(self._hangarVisible)
+                self._injectorView.flashObject.as_setVisible(False)
             except Exception:
                 logger.exception('panel init calls failed')
         self._refresh()
@@ -434,8 +526,10 @@ class MasteryController(object):
                 raw = fh.read()
                 cached, version = cPickle.loads(zlib.decompress(raw))
                 if version == _CACHE_VERSION and isinstance(cached, dict):
-                    self._xpCache  = cached.get('xp',  {}) or {}
-                    self._moeCache = cached.get('moe', {}) or {}
+                    self._xpCache    = cached.get('xp',    {}) or {}
+                    self._moeCache   = cached.get('moe',   {}) or {}
+                    self._xpCacheTs  = cached.get('xpTs',  {}) or {}
+                    self._moeCacheTs = cached.get('moeTs', {}) or {}
                     pos = cached.get('position')
                     if isinstance(pos, (list, tuple)) and len(pos) >= 2:
                         try:
@@ -473,6 +567,8 @@ class MasteryController(object):
             payload = {
                 'xp':            self._xpCache,
                 'moe':           self._moeCache,
+                'xpTs':          self._xpCacheTs,
+                'moeTs':         self._moeCacheTs,
                 'position':      list(self._position),
                 'viewMode':      self._viewMode,
                 'markHistory':   self._markHistory,
@@ -485,6 +581,14 @@ class MasteryController(object):
                          len(self._xpCache), len(self._moeCache), self._viewMode)
         except Exception:
             logger.exception('cache: failed to save')
+
+    def _isFresh(self, tankID, distribution):
+        tsMap = self._xpCacheTs if distribution == 'xp' else self._moeCacheTs
+        ts = tsMap.get(tankID, 0)
+        try:
+            return (time.time() - float(ts)) < _CACHE_TTL_SECONDS
+        except (TypeError, ValueError):
+            return False
 
     def _refresh(self):
         if not (self._panelReady and self._injectorView):
@@ -507,6 +611,8 @@ class MasteryController(object):
 
         xp  = self._xpCache.get(tankID)
         moe = self._moeCache.get(tankID)
+        xpFresh  = xp  is not None and self._isFresh(tankID, 'xp')
+        moeFresh = moe is not None and self._isFresh(tankID, 'damage')
         if xp is None and moe is None:
             try:
                 self._injectorView.flashObject.as_setLoading()
@@ -514,11 +620,11 @@ class MasteryController(object):
                 pass
         if xp is not None:
             self._pushMastery(xp)
-        else:
+        if not xpFresh:
             self._requestDistribution(tankID, 'xp')
         if moe is not None:
             self._pushMoe(moe)
-        else:
+        if not moeFresh:
             self._requestDistribution(tankID, 'damage')
         self._pushHistory(tankID)
 
@@ -561,35 +667,60 @@ class MasteryController(object):
         except Exception:
             logger.exception('as_setBattleHistory failed')
 
-    def _requestDistribution(self, tankID, distribution):
+    def _requestDistribution(self, tankID, distribution, attempt=1):
         isXp    = (distribution == 'xp')
         pending = self._pendingXp if isXp else self._pendingMoe
-        if tankID in pending:
-            return
-        pending.add(tankID)
+        if attempt == 1:
+            if tankID in pending:
+                return
+            pending.add(tankID)
         query = _XP_PERCENTILES_QUERY if isXp else _MOE_PERCENTILES_QUERY
         url   = _buildApiUrl(tankID, distribution, query)
-        logger.debug('api request tankID=%s dist=%s url=%s', tankID, distribution, url)
+        logger.debug('api request tankID=%s dist=%s attempt=%d url=%s',
+                     tankID, distribution, attempt, url)
         try:
             BigWorld.fetchURL(
                 url,
-                lambda response, t=tankID, d=distribution: self._onApiResponse(t, d, response),
+                lambda response, t=tankID, d=distribution, a=attempt: self._onApiResponse(t, d, response, a),
                 None, _API_TIMEOUT, 'GET', None,
             )
         except Exception:
-            logger.exception('fetchURL failed tankID=%s dist=%s', tankID, distribution)
-            pending.discard(tankID)
-            if isXp:
-                self._pushMastery(self._EMPTY_XP)
-            else:
-                self._pushMoe(self._EMPTY_MOE)
+            logger.exception('fetchURL failed tankID=%s dist=%s attempt=%d',
+                             tankID, distribution, attempt)
+            self._handleApiFailure(tankID, distribution, attempt)
 
-    def _onApiResponse(self, tankID, distribution, response):
+    def _retryRequest(self, tankID, distribution, attempt):
+        if not self._enabled:
+            pending = self._pendingXp if distribution == 'xp' else self._pendingMoe
+            pending.discard(tankID)
+            return
+        self._requestDistribution(tankID, distribution, attempt)
+
+    def _handleApiFailure(self, tankID, distribution, attempt):
+        isXp    = (distribution == 'xp')
+        pending = self._pendingXp if isXp else self._pendingMoe
+        if attempt < _API_MAX_ATTEMPTS:
+            delay = _API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            nextAttempt = attempt + 1
+            logger.debug('api retry tankID=%s dist=%s in %.1fs (next attempt=%d)',
+                         tankID, distribution, delay, nextAttempt)
+            BigWorld.callback(delay, lambda: self._retryRequest(tankID, distribution, nextAttempt))
+            return
+        pending.discard(tankID)
+        logger.debug('api: gave up tankID=%s dist=%s after %d attempts',
+                     tankID, distribution, attempt)
+        current = g_currentVehicle.item if g_currentVehicle.isPresent() else None
+        isCurrent = current is not None and getattr(current, 'intCD', None) == tankID
+        if isCurrent and self._xpCache.get(tankID) is None and self._moeCache.get(tankID) is None:
+            empty = self._EMPTY_XP if isXp else self._EMPTY_MOE
+            (self._pushMastery if isXp else self._pushMoe)(empty)
+
+    def _onApiResponse(self, tankID, distribution, response, attempt=1):
         isXp    = (distribution == 'xp')
         mapping = _PERCENTILE_TO_KEY if isXp else _MOE_PERCENTILE_TO_KEY
         pending = self._pendingXp if isXp else self._pendingMoe
-        pending.discard(tankID)
         parsed = None
+        status = 0
         try:
             body = getattr(response, 'body', None)
             status = getattr(response, 'responseCode', 0)
@@ -597,20 +728,32 @@ class MasteryController(object):
                 payload = json.loads(body)
                 parsed = _parseApiResponse(payload, tankID, mapping)
         except Exception:
-            logger.exception('api parse failed tankID=%s dist=%s', tankID, distribution)
-        current = g_currentVehicle.item if g_currentVehicle.isPresent() else None
-        isCurrent = current is not None and getattr(current, 'intCD', None) == tankID
+            logger.exception('api parse failed tankID=%s dist=%s attempt=%d',
+                             tankID, distribution, attempt)
         if parsed is None:
-            logger.debug('api: no data tankID=%s dist=%s', tankID, distribution)
-            if isCurrent:
+            isTransient = (not status) or status >= 500 or status == 429
+            if isTransient and attempt < _API_MAX_ATTEMPTS:
+                self._handleApiFailure(tankID, distribution, attempt)
+                return
+            pending.discard(tankID)
+            logger.debug('api: no data tankID=%s dist=%s status=%s', tankID, distribution, status)
+            current = g_currentVehicle.item if g_currentVehicle.isPresent() else None
+            isCurrent = current is not None and getattr(current, 'intCD', None) == tankID
+            if isCurrent and self._xpCache.get(tankID) is None and self._moeCache.get(tankID) is None:
                 empty = self._EMPTY_XP if isXp else self._EMPTY_MOE
                 (self._pushMastery if isXp else self._pushMoe)(empty)
             return
+        pending.discard(tankID)
+        nowTs = int(time.time())
         if isXp:
-            self._xpCache[tankID]  = parsed
+            self._xpCache[tankID]   = parsed
+            self._xpCacheTs[tankID] = nowTs
         else:
-            self._moeCache[tankID] = parsed
+            self._moeCache[tankID]   = parsed
+            self._moeCacheTs[tankID] = nowTs
         self._scheduleSaveCache()
+        current = g_currentVehicle.item if g_currentVehicle.isPresent() else None
+        isCurrent = current is not None and getattr(current, 'intCD', None) == tankID
         if isCurrent:
             (self._pushMastery if isXp else self._pushMoe)(parsed)
 
@@ -623,10 +766,396 @@ class MasteryController(object):
             logger.exception('drag save failed')
 
 
+class _BattleResultsCollector(object):
+
+    _TICK_INTERVAL = 1.0
+    _MAX_GATE_ATTEMPTS = 30
+    _MAX_RESPONSE_ATTEMPTS = 30
+    _MAX_DOSSIER_ATTEMPTS = 20
+    _DOSSIER_FIRST_DELAY = 0.5
+    _DOSSIER_RETRY_DELAY = 1.5
+
+    def __init__(self, controller):
+        self._controller = controller
+        self._queue = deque()
+        self._available = False
+        self._terminated = False
+        self._installed = False
+        self._tickCallbackId = None
+        self._dossierCallbackIds = {}
+
+    def init(self):
+        if self._installed:
+            return
+        if g_messengerEvents is None or SYS_MESSAGE_TYPE is None:
+            logger.debug('battle-results: messenger API unavailable, collector disabled')
+            return
+        try:
+            g_messengerEvents.serviceChannel.onChatMessageReceived += self._onServiceMessage
+        except Exception:
+            logger.exception('battle-results: serviceChannel hook failed')
+            return
+        try:
+            g_playerEvents.onAccountBecomeNonPlayer += self._onBecomeNonPlayer
+        except Exception:
+            pass
+        if g_eventBus is not None and GUICommonEvent is not None:
+            try:
+                g_eventBus.addListener(GUICommonEvent.LOBBY_VIEW_LOADED, self._onLobbyLoaded)
+            except Exception:
+                logger.exception('battle-results: LOBBY_VIEW_LOADED subscribe failed')
+        self._installed = True
+        self._terminated = False
+        self._scheduleTick()
+        logger.debug('battle-results: collector started')
+
+    def fini(self):
+        self._terminated = True
+        _cancelCallbackSafe(self._tickCallbackId)
+        self._tickCallbackId = None
+        for cbid, _mark in list(self._dossierCallbackIds.values()):
+            _cancelCallbackSafe(cbid)
+        self._dossierCallbackIds.clear()
+        if not self._installed:
+            return
+        try:
+            g_messengerEvents.serviceChannel.onChatMessageReceived -= self._onServiceMessage
+        except Exception:
+            pass
+        try:
+            g_playerEvents.onAccountBecomeNonPlayer -= self._onBecomeNonPlayer
+        except Exception:
+            pass
+        if g_eventBus is not None and GUICommonEvent is not None:
+            try:
+                g_eventBus.removeListener(GUICommonEvent.LOBBY_VIEW_LOADED, self._onLobbyLoaded)
+            except Exception:
+                pass
+        self._queue.clear()
+        self._installed = False
+        self._available = False
+
+    def _onLobbyLoaded(self, *_):
+        self._available = True
+
+    def _onBecomeNonPlayer(self, *_):
+        self._available = False
+
+    def _onServiceMessage(self, _client, message):
+        try:
+            if not self._isBattleResultMessage(message):
+                return
+            data = getattr(message, 'data', None) or {}
+            try:
+                arenaID = int(data.get('arenaUniqueID', 0) or 0)
+            except (TypeError, ValueError):
+                return
+            if arenaID <= 0:
+                return
+            for queued in self._queue:
+                if queued[0] == arenaID:
+                    return
+            self._queue.append((arenaID, 0))
+            logger.debug('battle-results: arena %s queued', arenaID)
+        except Exception:
+            logger.exception('battle-results: onServiceMessage failed')
+
+    @staticmethod
+    def _isBattleResultMessage(message):
+        messageType = getattr(message, 'type', None)
+        if messageType is None or SYS_MESSAGE_TYPE is None:
+            return False
+        try:
+            name = str(SYS_MESSAGE_TYPE[messageType])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return name == 'battleResults'
+
+    def _scheduleTick(self):
+        if self._terminated:
+            return
+        _cancelCallbackSafe(self._tickCallbackId)
+        self._tickCallbackId = BigWorld.callback(self._TICK_INTERVAL, self._tick)
+
+    def _tick(self):
+        self._tickCallbackId = None
+        if self._terminated:
+            return
+        try:
+            if self._available and self._queue:
+                arenaID, attempt = self._queue.popleft()
+                self._processOne(arenaID, attempt)
+        except Exception:
+            logger.exception('battle-results: tick failed')
+        self._scheduleTick()
+
+    def _processOne(self, arenaID, attempt):
+        try:
+            player = BigWorld.player()
+            if not isinstance(player, PlayerAccount):
+                self._requeueOrDrop(arenaID, attempt, 'no PlayerAccount')
+                return
+            try:
+                synced = ServicesLocator.itemsCache.isSynced()
+            except Exception:
+                synced = False
+            if not synced:
+                self._requeueOrDrop(arenaID, attempt, 'itemsCache not synced')
+                return
+            cache = getattr(player, 'battleResultsCache', None)
+            if cache is None:
+                logger.debug('battle-results: arena %s no battleResultsCache, drop', arenaID)
+                return
+            cache.get(arenaID, functools.partial(self._onResults, arenaID, attempt))
+        except Exception:
+            logger.exception('battle-results: processOne failed arena %s', arenaID)
+
+    def _requeueOrDrop(self, arenaID, attempt, reason):
+        if attempt < self._MAX_GATE_ATTEMPTS:
+            self._queue.append((arenaID, attempt + 1))
+            logger.debug('battle-results: gate wait (%s) arena %s (%d/%d)',
+                         reason, arenaID, attempt + 1, self._MAX_GATE_ATTEMPTS)
+        else:
+            logger.debug('battle-results: dropping arena %s (gate %s exhausted)',
+                         arenaID, reason)
+
+    def _onResults(self, arenaID, attempt, responseCode, results=None):
+        try:
+            if responseCode is None or responseCode < 0:
+                if attempt < self._MAX_RESPONSE_ATTEMPTS:
+                    self._queue.append((arenaID, attempt + 1))
+                    logger.debug('battle-results: arena %s retry rc=%s (%d/%d)',
+                                 arenaID, responseCode, attempt + 1, self._MAX_RESPONSE_ATTEMPTS)
+                else:
+                    logger.debug('battle-results: arena %s gave up after %d attempts rc=%s',
+                                 arenaID, attempt, responseCode)
+                return
+            if not results:
+                logger.debug('battle-results: arena %s empty results rc=%s, drop',
+                             arenaID, responseCode)
+                return
+            self._extractAndApply(arenaID, results)
+        except Exception:
+            logger.exception('battle-results: onResults failed arena %s', arenaID)
+
+    def _extractAndApply(self, arenaID, results):
+        if not isinstance(results, dict):
+            return
+        common = results.get('common', {}) or {}
+        guiType = common.get('guiType', 0)
+        allowed = []
+        for attr in ('RANDOM', 'MAPBOX'):
+            val = getattr(constants.ARENA_GUI_TYPE, attr, None)
+            if val is not None:
+                allowed.append(val)
+        if allowed and guiType not in allowed:
+            logger.debug('battle-results: arena %s skipped, guiType=%s not in %s',
+                         arenaID, guiType, allowed)
+            return
+
+        accountDBID = self._getAccountDBID()
+        if not accountDBID:
+            logger.debug('battle-results: arena %s no accountDBID', arenaID)
+            return
+
+        vehicles = results.get('vehicles', {}) or {}
+        tankID = None
+        for _, vehicleInfo in vehicles.iteritems():
+            if not vehicleInfo:
+                continue
+            entry = vehicleInfo[0] if isinstance(vehicleInfo, list) else vehicleInfo
+            if not isinstance(entry, dict):
+                continue
+            try:
+                if int(entry.get('accountDBID', 0) or 0) != accountDBID:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
+                tankID = int(entry.get('typeCompDescr', 0) or 0)
+            except (TypeError, ValueError):
+                tankID = 0
+            if tankID:
+                break
+
+        if not tankID:
+            logger.debug('battle-results: arena %s player tank not found', arenaID)
+            return
+        self._scheduleDossierRead(tankID, attempt=0)
+
+    @staticmethod
+    def _getAccountDBID():
+        try:
+            player = BigWorld.player()
+            dbid = int(getattr(player, 'databaseID', 0) or 0)
+            if dbid:
+                return dbid
+        except Exception:
+            pass
+        return 0
+
+    def _scheduleDossierRead(self, tankID, attempt):
+        if self._terminated:
+            return
+        prev = self._dossierCallbackIds.pop(tankID, None)
+        if prev is not None:
+            _cancelCallbackSafe(prev[0])
+        delay = self._DOSSIER_FIRST_DELAY if attempt == 0 else self._DOSSIER_RETRY_DELAY
+        expectedMark = self._controller._lastKnownMark.get(tankID)
+        cbid = BigWorld.callback(delay, lambda t=tankID, a=attempt: self._readDossier(t, a))
+        self._dossierCallbackIds[tankID] = (cbid, expectedMark)
+
+    def _readDossier(self, tankID, attempt):
+        entry = self._dossierCallbackIds.pop(tankID, None)
+        if self._terminated:
+            return
+        expectedPrev = entry[1] if entry else None
+        moe = _readMarkForTankID(tankID)
+        if moe is None:
+            if attempt < self._MAX_DOSSIER_ATTEMPTS:
+                self._scheduleDossierRead(tankID, attempt + 1)
+            else:
+                logger.debug('battle-results: dossier gave up tankID=%s', tankID)
+            return
+        if (expectedPrev is not None
+                and abs(float(expectedPrev) - float(moe)) < 0.0001
+                and attempt < self._MAX_DOSSIER_ATTEMPTS):
+            logger.debug('battle-results: dossier unchanged tankID=%s (%.2f), retry %d',
+                         tankID, moe, attempt + 1)
+            self._scheduleDossierRead(tankID, attempt + 1)
+            return
+        try:
+            self._controller._onBattleProcessed(tankID, moe)
+        except Exception:
+            logger.exception('battle-results: controller dispatch failed tankID=%s', tankID)
+
+
+class _ModalWindowWatcher(object):
+
+    _STATUS_LOADED_FALLBACK    = 2
+    _STATUS_DESTROYED_FALLBACK = 4
+
+    def __init__(self, controller):
+        self._controller = controller
+        self._activeIDs = set()
+        self._installed = False
+        self._wm = None
+        self._modalLayers = None
+
+    def init(self):
+        if self._installed:
+            return
+        if dependency is None or IGuiLoader is None:
+            logger.debug('modal-watcher: GuiLoader API unavailable, watcher disabled')
+            return
+        try:
+            guiLoader = dependency.instance(IGuiLoader)
+            self._wm = getattr(guiLoader, 'windowsManager', None)
+        except Exception:
+            logger.exception('modal-watcher: cannot get windowsManager')
+            return
+        if self._wm is None:
+            logger.debug('modal-watcher: windowsManager is None')
+            return
+        evt = getattr(self._wm, 'onWindowStatusChanged', None)
+        if evt is None:
+            logger.debug('modal-watcher: onWindowStatusChanged unavailable')
+            return
+        try:
+            evt += self._onWindowStatusChanged
+        except Exception:
+            logger.exception('modal-watcher: subscribe failed')
+            return
+        self._installed = True
+        logger.debug('modal-watcher: started, modalLayers=%s', self._getModalLayers())
+
+    def fini(self):
+        if self._installed and self._wm is not None:
+            try:
+                self._wm.onWindowStatusChanged -= self._onWindowStatusChanged
+            except Exception:
+                pass
+        self._activeIDs.clear()
+        self._wm = None
+        self._installed = False
+
+    def _getModalLayers(self):
+        if self._modalLayers is None:
+            layers = set()
+            for name in ('WINDOW', 'FULLSCREEN_WINDOW', 'TOP_WINDOW'):
+                v = getattr(WindowLayer, name, None)
+                if v is not None:
+                    layers.add(v)
+            if not layers:
+                layers = {10, 11, 12}
+            self._modalLayers = layers
+        return self._modalLayers
+
+    @staticmethod
+    def _statusEquals(status, namedAttr, fallback):
+        if WindowStatus is not None:
+            named = getattr(WindowStatus, namedAttr, None)
+            if named is not None:
+                return status == named
+        return status == fallback
+
+    def _isLoaded(self, status):
+        return self._statusEquals(status, 'LOADED', self._STATUS_LOADED_FALLBACK)
+
+    def _isDestroyed(self, status):
+        return self._statusEquals(status, 'DESTROYED', self._STATUS_DESTROYED_FALLBACK)
+
+    def _onWindowStatusChanged(self, uniqueID, newStatus):
+        try:
+            loaded = self._isLoaded(newStatus)
+            destroyed = self._isDestroyed(newStatus)
+            if not (loaded or destroyed):
+                return
+            if loaded:
+                if uniqueID in self._activeIDs:
+                    return
+                if self._wm is None:
+                    return
+                window = None
+                try:
+                    window = self._wm.getWindow(uniqueID)
+                except Exception:
+                    return
+                if window is None:
+                    return
+                layer = getattr(window, 'layer', -1)
+                if layer not in self._getModalLayers():
+                    return
+                wasEmpty = (len(self._activeIDs) == 0)
+                self._activeIDs.add(uniqueID)
+                logger.debug('modal-watcher: opened uniqueID=%s layer=%s count=%d',
+                             uniqueID, layer, len(self._activeIDs))
+                if wasEmpty:
+                    self._dispatch(True)
+            else:
+                if uniqueID not in self._activeIDs:
+                    return
+                self._activeIDs.discard(uniqueID)
+                logger.debug('modal-watcher: closed uniqueID=%s count=%d',
+                             uniqueID, len(self._activeIDs))
+                if not self._activeIDs:
+                    self._dispatch(False)
+        except Exception:
+            logger.exception('modal-watcher: status handler failed')
+
+    def _dispatch(self, isModalOpen):
+        try:
+            self._controller._onModalChanged(isModalOpen)
+        except Exception:
+            logger.exception('modal-watcher: controller dispatch failed')
+
+
 class _Mod(object):
 
     def __init__(self):
         self._ctrl = MasteryController()
+        self._results = _BattleResultsCollector(self._ctrl)
+        self._modalWatcher = _ModalWindowWatcher(self._ctrl)
 
     def init(self):
         _loadLocalization()
@@ -635,6 +1164,8 @@ class _Mod(object):
         g_playerEvents.onAvatarBecomePlayer    += self._onAvatarBecomePlayer
         g_playerEvents.onAccountBecomeNonPlayer += self._onAccountBecomeNonPlayer
         g_playerEvents.onDisconnected          += self._onDisconnected
+        self._results.init()
+        self._modalWatcher.init()
         if self._isAccount():
             self._ctrl.enable()
         logger.debug('initialized v%s', __version__)
@@ -647,6 +1178,8 @@ class _Mod(object):
             g_playerEvents.onDisconnected          -= self._onDisconnected
         except Exception:
             pass
+        self._modalWatcher.fini()
+        self._results.fini()
         self._ctrl.disable()
         _unregisterFlash()
         logger.debug('finalized')
