@@ -1082,12 +1082,12 @@ class _ModalWindowWatcher(object):
     def _getModalLayers(self):
         if self._modalLayers is None:
             layers = set()
-            for name in ('WINDOW', 'FULLSCREEN_WINDOW', 'TOP_WINDOW'):
+            for name in ('FULLSCREEN_WINDOW', 'TOP_WINDOW'):
                 v = getattr(WindowLayer, name, None)
                 if v is not None:
                     layers.add(v)
             if not layers:
-                layers = {10, 11, 12}
+                layers = {8, 10}
             self._modalLayers = layers
         return self._modalLayers
 
