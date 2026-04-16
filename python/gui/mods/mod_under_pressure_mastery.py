@@ -58,7 +58,7 @@ except ImportError:
 logger = logging.getLogger('under_pressure.mastery')
 logger.setLevel(logging.DEBUG if os.path.isfile('.debug_mods') else logging.ERROR)
 
-__version__ = '0.0.5'
+__version__ = '0.0.6'
 
 _LINKAGE = 'MasteryPanelInjector'
 _SWF = 'MasteryPanel.swf'
@@ -1105,6 +1105,24 @@ class _ModalWindowWatcher(object):
     def _isDestroyed(self, status):
         return self._statusEquals(status, 'DESTROYED', self._STATUS_DESTROYED_FALLBACK)
 
+    @staticmethod
+    def _isOwnPanel(window):
+        if window is None:
+            return False
+        for holder in (window, getattr(window, 'content', None)):
+            if holder is None:
+                continue
+            try:
+                viewKey = getattr(holder, 'viewKey', None)
+            except Exception:
+                viewKey = None
+            if viewKey is None:
+                continue
+            alias = getattr(viewKey, 'alias', None) or getattr(viewKey, 'name', None)
+            if alias == _LINKAGE:
+                return True
+        return False
+
     def _onWindowStatusChanged(self, uniqueID, newStatus):
         try:
             loaded = self._isLoaded(newStatus)
@@ -1122,6 +1140,9 @@ class _ModalWindowWatcher(object):
                 except Exception:
                     return
                 if window is None:
+                    return
+                if self._isOwnPanel(window):
+                    logger.debug('modal-watcher: ignoring own injector uniqueID=%s', uniqueID)
                     return
                 layer = getattr(window, 'layer', -1)
                 if layer not in self._getModalLayers():
