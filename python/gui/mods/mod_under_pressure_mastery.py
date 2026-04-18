@@ -31,14 +31,31 @@ except ImportError:
     SYS_MESSAGE_TYPE = None
 
 try:
-    from gui.shared import g_eventBus
+    from gui.shared import g_eventBus, EVENT_BUS_SCOPE
 except ImportError:
     g_eventBus = None
+    EVENT_BUS_SCOPE = None
 
 try:
-    from gui.shared.events import GUICommonEvent
+    from gui.shared.events import GUICommonEvent, AppLifeCycleEvent
 except ImportError:
     GUICommonEvent = None
+    AppLifeCycleEvent = None
+
+try:
+    from gui.app_loader.settings import APP_NAME_SPACE
+except ImportError:
+    APP_NAME_SPACE = None
+
+try:
+    from account_helpers import getAccountDatabaseID
+except ImportError:
+    getAccountDatabaseID = None
+
+try:
+    from items import vehicles as _vehiclesModule
+except ImportError:
+    _vehiclesModule = None
 
 try:
     from helpers import dependency
@@ -93,7 +110,8 @@ _INJECT_MAX_ATTEMPTS = 30
 _API_TIMEOUT = 5.0
 _API_MAX_ATTEMPTS = 3
 _API_RETRY_BASE_DELAY = 2.0
-_MAX_HISTORY = 10
+_MAX_HISTORY = 100
+_MIN_TANK_LEVEL = 5
 _DEFAULT_VIEW_MODE = 0
 
 try:
@@ -103,7 +121,7 @@ except AttributeError:
 
 _CACHE_DIR = os.path.normpath(os.path.join(os.path.dirname(_prefsFilePath), 'mods', 'mastery'))
 _CACHE_FILE = os.path.join(_CACHE_DIR, 'cache.dat')
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 _CACHE_TTL_SECONDS = 3 * 24 * 3600
 _CACHE_SAVE_DEBOUNCE = 3.0
 
@@ -256,6 +274,98 @@ def _readMarkForTankID(tankID):
     return _readMarkPercent(vehicle)
 
 
+def _getTankLevelByCD(compactDescr):
+    if _vehiclesModule is None or compactDescr is None:
+        return 0
+    try:
+        _, nationID, innationID = _vehiclesModule.parseIntCompactDescr(int(compactDescr))
+        return int(_vehiclesModule.g_cache.vehicle(nationID, innationID).level)
+    except Exception:
+        return 0
+
+
+def _extractMapName(common):
+    if not isinstance(common, dict):
+        return u''
+    arenaTypeID = common.get('arenaTypeID')
+    if not arenaTypeID:
+        return u''
+    try:
+        from gui.battle_control.arena_info.arena_vos import getArenaTypeName
+        name = getArenaTypeName(arenaTypeID)
+        if name:
+            return unicode(name)
+    except Exception:
+        pass
+    try:
+        from ArenaType import g_cache as arenaCache
+        arenaType = arenaCache.get(arenaTypeID)
+        if arenaType is not None:
+            raw = getattr(arenaType, 'name', None) or getattr(arenaType, 'geometryName', None)
+            if raw:
+                try:
+                    from helpers import i18n
+                    return unicode(i18n.makeString(raw))
+                except Exception:
+                    return unicode(raw)
+    except Exception:
+        pass
+    return u''
+
+
+def _getActiveAccountDBID():
+    if getAccountDatabaseID is not None:
+        try:
+            dbid = int(getAccountDatabaseID() or 0)
+            if dbid:
+                return dbid
+        except Exception:
+            pass
+    try:
+        player = BigWorld.player()
+        dbid = int(getattr(player, 'databaseID', 0) or 0)
+        if dbid:
+            return dbid
+    except Exception:
+        pass
+    return 0
+
+
+class MasterySessionHistory(object):
+
+    def __init__(self):
+        self._preBattleSnapshot = {}
+
+    def snapshotBeforeBattle(self, tankID, mark, mapName=None):
+        if tankID is None or mark is None:
+            return
+        try:
+            markValue = float(mark)
+        except (TypeError, ValueError):
+            return
+        self._preBattleSnapshot[int(tankID)] = {
+            'mark': markValue,
+            'map': unicode(mapName) if mapName else u'',
+        }
+        logger.debug('session: snapshot tankID=%s mark=%.2f map=%s',
+                     tankID, markValue, mapName)
+
+    def overrideMapName(self, tankID, mapName):
+        if tankID is None or not mapName:
+            return
+        snap = self._preBattleSnapshot.get(int(tankID))
+        if snap is not None:
+            snap['map'] = unicode(mapName)
+
+    def consumeSnapshot(self, tankID):
+        if tankID is None:
+            return None
+        return self._preBattleSnapshot.pop(int(tankID), None)
+
+    def reset(self):
+        self._preBattleSnapshot.clear()
+
+
 class MasteryPanelInjectorView(View):
     _g_controller = None
 
@@ -298,7 +408,8 @@ def _unregisterFlash():
 
 class MasteryController(object):
 
-    def __init__(self):
+    def __init__(self, session=None):
+        self._session       = session
         self._injectorView  = None
         self._panelReady    = False
         self._enabled       = False
@@ -314,20 +425,67 @@ class MasteryController(object):
         self._moeCacheTs    = {}
         self._pendingXp     = set()
         self._pendingMoe    = set()
+        # Per-account history: {accountDBID: {tankID: [entry_dict, ...]}}
         self._markHistory   = {}
+        # Per-account last known mark: {accountDBID: {tankID: float}}
         self._lastKnownMark = {}
+        self._currentAccountDBID = 0
         self._saveRev       = 0
         self._saveCallbackId = None
         self._loadCache()
+
+    def setActiveAccount(self, accountDBID):
+        try:
+            accountDBID = int(accountDBID or 0)
+        except (TypeError, ValueError):
+            return
+        if not accountDBID:
+            return
+        if self._currentAccountDBID != accountDBID:
+            self._currentAccountDBID = accountDBID
+            logger.debug('controller: active account set to %s', accountDBID)
+            if self._enabled and self._panelReady:
+                self._refresh()
+
+    def clearActiveAccount(self):
+        self._currentAccountDBID = 0
+
+    def _getHistoryForTank(self, tankID):
+        if not self._currentAccountDBID or tankID is None:
+            return []
+        bucket = self._markHistory.get(self._currentAccountDBID)
+        if not bucket:
+            return []
+        return bucket.get(tankID, [])
+
+    def _getLastKnownMark(self, tankID):
+        if not self._currentAccountDBID or tankID is None:
+            return None
+        bucket = self._lastKnownMark.get(self._currentAccountDBID)
+        if not bucket:
+            return None
+        return bucket.get(tankID)
+
+    def _setLastKnownMark(self, tankID, mark):
+        if not self._currentAccountDBID or tankID is None or mark is None:
+            return
+        bucket = self._lastKnownMark.setdefault(self._currentAccountDBID, {})
+        prev = bucket.get(tankID)
+        if prev is None or abs(float(prev) - float(mark)) > 0.0001:
+            bucket[tankID] = float(mark)
+            self._scheduleSaveCache()
 
     def enable(self):
         if self._enabled:
             return
         self._enabled = True
-        self._injectorView  = None
-        self._panelReady    = False
         self._visibleByData = False
-        MasteryPanelInjectorView._g_controller = self
+        # _g_controller is bound permanently in _Mod.__init__ to survive
+        # SF lobby app recreation on relogin/server change. Do NOT wipe
+        # _injectorView/_panelReady here: the view may have been (re)created
+        # already via AppLifeCycleEvent.INITIALIZED before enable() runs.
+        # Clearing is handled by _onInjectorDisposed when the view actually
+        # goes away.
         g_currentVehicle.onChanged += self._onVehicleChanged
         try:
             ServicesLocator.settingsCore.interfaceScale.onScaleChanged += self._onScaleChanged
@@ -344,7 +502,10 @@ class MasteryController(object):
         else:
             self._hangarVisible = False
         if self._hangarVisible:
-            self._injectFlash()
+            if self._injectorView is None:
+                self._injectFlash()
+            else:
+                self._refresh()
         logger.debug('enabled, hangarVisible=%s', self._hangarVisible)
 
     def disable(self):
@@ -367,9 +528,17 @@ class MasteryController(object):
                 lsm.onVisibleRouteChanged -= self._onVisibleRouteChanged
             except Exception:
                 pass
-        MasteryPanelInjectorView._g_controller = None
-        self._injectorView  = None
-        self._panelReady    = False
+        # Do NOT null _g_controller, _injectorView or _panelReady here:
+        # _g_controller is bound permanently in _Mod.__init__ so the injector
+        # view recreated on relogin can still find us. _injectorView lifecycle
+        # is handled by _onInjectorDisposed when the view actually goes away
+        # (SF lobby app teardown). Nulling here would lose the fresh view that
+        # AppLifeCycleEvent.INITIALIZED pre-loads before enable() runs again.
+        if self._panelReady and self._injectorView is not None:
+            try:
+                self._injectorView.flashObject.as_setVisible(False)
+            except Exception:
+                pass
         self._hangarVisible = False
         self._visibleByData = False
         self._modalOpen     = False
@@ -400,8 +569,6 @@ class MasteryController(object):
         self._hangarVisible = self._isHangarState(routeInfo.state)
         if self._hangarVisible and not self._panelReady and not self._injectorView:
             self._injectFlash()
-        if self._hangarVisible:
-            self._captureCurrentMarkSample()
         self._updateVisibility()
 
     def _updateVisibility(self):
@@ -422,10 +589,10 @@ class MasteryController(object):
         self._updateVisibility()
 
     def _onVehicleChanged(self):
-        self._captureCurrentMarkSample(forceAppend=False)
+        self._captureCurrentMarkSample()
         self._refresh()
 
-    def _captureCurrentMarkSample(self, forceAppend=False):
+    def _captureCurrentMarkSample(self):
         if not g_currentVehicle.isPresent():
             return
         vehicle = g_currentVehicle.item
@@ -435,31 +602,53 @@ class MasteryController(object):
         mark = _readMarkPercent(vehicle)
         if mark is None:
             return
-        history = self._markHistory.setdefault(tankID, [])
-        last = history[-1] if history else None
-        if forceAppend or last is None or abs(float(last) - float(mark)) > 0.0001:
-            history.append(mark)
-            if len(history) > _MAX_HISTORY:
-                del history[:-_MAX_HISTORY]
-        self._lastKnownMark[tankID] = mark
+        self._setLastKnownMark(tankID, mark)
 
-    def _onBattleProcessed(self, tankID, moe):
+    def _onBattleProcessed(self, tankID, newMark, mapName=None):
         try:
-            value = float(moe)
+            value = float(newMark)
         except (TypeError, ValueError):
             return
-        history = self._markHistory.setdefault(tankID, [])
-        last = history[-1] if history else None
-        appended = False
-        if last is None or abs(float(last) - value) > 0.0001:
-            history.append(value)
-            if len(history) > _MAX_HISTORY:
-                del history[:-_MAX_HISTORY]
-            appended = True
-        self._lastKnownMark[tankID] = value
+        if not self._currentAccountDBID:
+            logger.debug('battle: skip, no active account (tankID=%s)', tankID)
+            return
+
+        preMark = None
+        entryMap = unicode(mapName) if mapName else u''
+        if self._session is not None:
+            snap = self._session.consumeSnapshot(tankID)
+            if snap is not None:
+                try:
+                    preMark = float(snap.get('mark'))
+                except (TypeError, ValueError):
+                    preMark = None
+                if not entryMap:
+                    entryMap = unicode(snap.get('map', u'') or u'')
+        if preMark is None:
+            fallback = self._getLastKnownMark(tankID)
+            if fallback is not None:
+                try:
+                    preMark = float(fallback)
+                except (TypeError, ValueError):
+                    preMark = None
+        delta = (value - preMark) if preMark is not None else 0.0
+
+        historyBucket = self._markHistory.setdefault(self._currentAccountDBID, {})
+        history = historyBucket.setdefault(tankID, [])
+        entry = {
+            'value': value,
+            'map': entryMap,
+            'delta': float(delta),
+            'ts': int(time.time()),
+        }
+        history.append(entry)
+        if len(history) > _MAX_HISTORY:
+            del history[:-_MAX_HISTORY]
+
+        self._setLastKnownMark(tankID, value)
         self._scheduleSaveCache()
-        logger.debug('battle: tankID=%s moe=%.2f appended=%s history=%d',
-                     tankID, value, appended, len(history))
+        logger.debug('battle: account=%s tankID=%s mark=%.2f delta=%+.2f map=%s history=%d',
+                     self._currentAccountDBID, tankID, value, delta, entryMap, len(history))
         if (self._enabled and self._panelReady
                 and g_currentVehicle.isPresent()
                 and getattr(g_currentVehicle.item, 'intCD', None) == tankID):
@@ -525,7 +714,10 @@ class MasteryController(object):
             with open(_CACHE_FILE, 'rb') as fh:
                 raw = fh.read()
                 cached, version = cPickle.loads(zlib.decompress(raw))
-                if version == _CACHE_VERSION and isinstance(cached, dict):
+                if not isinstance(cached, dict):
+                    logger.debug('cache: bad payload type, discarding')
+                    return
+                if version == _CACHE_VERSION:
                     self._xpCache    = cached.get('xp',    {}) or {}
                     self._moeCache   = cached.get('moe',   {}) or {}
                     self._xpCacheTs  = cached.get('xpTs',  {}) or {}
@@ -542,12 +734,30 @@ class MasteryController(object):
                         self._viewMode = _DEFAULT_VIEW_MODE
                     self._markHistory   = cached.get('markHistory',   {}) or {}
                     self._lastKnownMark = cached.get('lastKnownMark', {}) or {}
-                    logger.debug('cache loaded: %d xp, %d moe, mode=%s, pos=%s',
-                                 len(self._xpCache), len(self._moeCache),
-                                 self._viewMode, self._position)
+                    logger.debug('cache loaded v%s: %d xp, %d moe, mode=%s, pos=%s, history-accounts=%d',
+                                 version, len(self._xpCache), len(self._moeCache),
+                                 self._viewMode, self._position, len(self._markHistory))
                 else:
-                    logger.debug('cache: version mismatch (got %s, want %s), discarding',
-                                 version, _CACHE_VERSION)
+                    # Migration: preserve API caches + position/mode, drop per-tank history
+                    # (old schema was not per-account, so it cannot be migrated safely).
+                    self._xpCache    = cached.get('xp',    {}) or {}
+                    self._moeCache   = cached.get('moe',   {}) or {}
+                    self._xpCacheTs  = cached.get('xpTs',  {}) or {}
+                    self._moeCacheTs = cached.get('moeTs', {}) or {}
+                    pos = cached.get('position')
+                    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                        try:
+                            self._position = [int(pos[0]), int(pos[1])]
+                        except (TypeError, ValueError):
+                            pass
+                    try:
+                        self._viewMode = int(cached.get('viewMode', _DEFAULT_VIEW_MODE))
+                    except (TypeError, ValueError):
+                        self._viewMode = _DEFAULT_VIEW_MODE
+                    self._markHistory = {}
+                    self._lastKnownMark = {}
+                    logger.debug('cache: legacy v%s -> v%s, kept %d xp/%d moe, dropped history',
+                                 version, _CACHE_VERSION, len(self._xpCache), len(self._moeCache))
         except Exception:
             logger.exception('cache: failed to load')
 
@@ -606,6 +816,16 @@ class MasteryController(object):
             self._visibleByData = False
             self._updateVisibility()
             return
+        tankLevel = getattr(g_currentVehicle.item, 'level', 0) or _getTankLevelByCD(tankID)
+        if tankLevel and tankLevel < _MIN_TANK_LEVEL:
+            logger.debug('refresh: hiding panel, tank level %d < %d', tankLevel, _MIN_TANK_LEVEL)
+            self._visibleByData = False
+            self._updateVisibility()
+            try:
+                self._injectorView.flashObject.as_clearData()
+            except Exception:
+                pass
+            return
         self._visibleByData = True
         self._updateVisibility()
 
@@ -657,8 +877,20 @@ class MasteryController(object):
     def _pushHistory(self, tankID):
         if not self._injectorView:
             return
-        values  = self._markHistory.get(tankID, [])[-_MAX_HISTORY:]
-        current = self._lastKnownMark.get(tankID)
+        history = self._getHistoryForTank(tankID)[-_MAX_HISTORY:]
+        values = []
+        for entry in history:
+            if isinstance(entry, dict):
+                try:
+                    values.append(float(entry.get('value', 0.0)))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                try:
+                    values.append(float(entry))
+                except (TypeError, ValueError):
+                    continue
+        current = self._getLastKnownMark(tankID)
         try:
             self._injectorView.flashObject.as_setBattleHistory(
                 values,
@@ -813,8 +1045,11 @@ class _BattleResultsCollector(object):
         self._terminated = True
         _cancelCallbackSafe(self._tickCallbackId)
         self._tickCallbackId = None
-        for cbid, _mark in list(self._dossierCallbackIds.values()):
-            _cancelCallbackSafe(cbid)
+        for record in list(self._dossierCallbackIds.values()):
+            try:
+                _cancelCallbackSafe(record[0])
+            except Exception:
+                pass
         self._dossierCallbackIds.clear()
         if not self._installed:
             return
@@ -981,7 +1216,12 @@ class _BattleResultsCollector(object):
         if not tankID:
             logger.debug('battle-results: arena %s player tank not found', arenaID)
             return
-        self._scheduleDossierRead(tankID, attempt=0)
+
+        mapName = _extractMapName(common)
+        if mapName and self._controller._session is not None:
+            self._controller._session.overrideMapName(tankID, mapName)
+
+        self._scheduleDossierRead(tankID, attempt=0, mapName=mapName)
 
     @staticmethod
     def _getAccountDBID():
@@ -994,18 +1234,19 @@ class _BattleResultsCollector(object):
             pass
         return 0
 
-    def _scheduleDossierRead(self, tankID, attempt):
+    def _scheduleDossierRead(self, tankID, attempt, mapName=u''):
         if self._terminated:
             return
         prev = self._dossierCallbackIds.pop(tankID, None)
         if prev is not None:
             _cancelCallbackSafe(prev[0])
         delay = self._DOSSIER_FIRST_DELAY if attempt == 0 else self._DOSSIER_RETRY_DELAY
-        expectedMark = self._controller._lastKnownMark.get(tankID)
-        cbid = BigWorld.callback(delay, lambda t=tankID, a=attempt: self._readDossier(t, a))
-        self._dossierCallbackIds[tankID] = (cbid, expectedMark)
+        expectedMark = self._controller._getLastKnownMark(tankID)
+        cbid = BigWorld.callback(
+            delay, lambda t=tankID, a=attempt, m=mapName: self._readDossier(t, a, m))
+        self._dossierCallbackIds[tankID] = (cbid, expectedMark, mapName)
 
-    def _readDossier(self, tankID, attempt):
+    def _readDossier(self, tankID, attempt, mapName=u''):
         entry = self._dossierCallbackIds.pop(tankID, None)
         if self._terminated:
             return
@@ -1013,7 +1254,7 @@ class _BattleResultsCollector(object):
         moe = _readMarkForTankID(tankID)
         if moe is None:
             if attempt < self._MAX_DOSSIER_ATTEMPTS:
-                self._scheduleDossierRead(tankID, attempt + 1)
+                self._scheduleDossierRead(tankID, attempt + 1, mapName=mapName)
             else:
                 logger.debug('battle-results: dossier gave up tankID=%s', tankID)
             return
@@ -1022,10 +1263,10 @@ class _BattleResultsCollector(object):
                 and attempt < self._MAX_DOSSIER_ATTEMPTS):
             logger.debug('battle-results: dossier unchanged tankID=%s (%.2f), retry %d',
                          tankID, moe, attempt + 1)
-            self._scheduleDossierRead(tankID, attempt + 1)
+            self._scheduleDossierRead(tankID, attempt + 1, mapName=mapName)
             return
         try:
-            self._controller._onBattleProcessed(tankID, moe)
+            self._controller._onBattleProcessed(tankID, moe, mapName=mapName)
         except Exception:
             logger.exception('battle-results: controller dispatch failed tankID=%s', tankID)
 
@@ -1174,9 +1415,17 @@ class _ModalWindowWatcher(object):
 class _Mod(object):
 
     def __init__(self):
-        self._ctrl = MasteryController()
+        self._session = MasterySessionHistory()
+        self._ctrl = MasteryController(session=self._session)
         self._results = _BattleResultsCollector(self._ctrl)
         self._modalWatcher = _ModalWindowWatcher(self._ctrl)
+        self._lobbyEventBound = False
+        # Bind controller to view class once and keep it bound: the SF lobby
+        # app is recreated on login <-> hangar transitions, and each re-init
+        # reloads the injector view. _populate() must find a controller to
+        # capture the new view reference — otherwise the panel does not
+        # reappear after a relogin or server change.
+        MasteryPanelInjectorView._g_controller = self._ctrl
 
     def init(self):
         _loadLocalization()
@@ -1187,7 +1436,11 @@ class _Mod(object):
         g_playerEvents.onDisconnected          += self._onDisconnected
         self._results.init()
         self._modalWatcher.init()
+        self._bindLobbyAppEvent()
         if self._isAccount():
+            dbid = _getActiveAccountDBID()
+            if dbid:
+                self._ctrl.setActiveAccount(dbid)
             self._ctrl.enable()
         logger.debug('initialized v%s', __version__)
 
@@ -1199,20 +1452,65 @@ class _Mod(object):
             g_playerEvents.onDisconnected          -= self._onDisconnected
         except Exception:
             pass
+        self._unbindLobbyAppEvent()
         self._modalWatcher.fini()
         self._results.fini()
         self._ctrl.disable()
+        MasteryPanelInjectorView._g_controller = None
         _unregisterFlash()
         logger.debug('finalized')
+
+    def _bindLobbyAppEvent(self):
+        if self._lobbyEventBound:
+            return
+        if g_eventBus is None or AppLifeCycleEvent is None or EVENT_BUS_SCOPE is None:
+            logger.debug('lobby-app event: API unavailable, relogin re-injection disabled')
+            return
+        try:
+            g_eventBus.addListener(
+                AppLifeCycleEvent.INITIALIZED, self._onLobbyAppInitialized,
+                scope=EVENT_BUS_SCOPE.GLOBAL,
+            )
+            self._lobbyEventBound = True
+        except Exception:
+            logger.exception('lobby-app event: subscribe failed')
+
+    def _unbindLobbyAppEvent(self):
+        if not self._lobbyEventBound:
+            return
+        try:
+            g_eventBus.removeListener(
+                AppLifeCycleEvent.INITIALIZED, self._onLobbyAppInitialized,
+                scope=EVENT_BUS_SCOPE.GLOBAL,
+            )
+        except Exception:
+            pass
+        self._lobbyEventBound = False
+
+    def _onLobbyAppInitialized(self, event):
+        try:
+            if APP_NAME_SPACE is not None and event.ns != APP_NAME_SPACE.SF_LOBBY:
+                return
+            app = ServicesLocator.appLoader.getApp(event.ns)
+            if app is None:
+                return
+            app.loadView(SFViewLoadParams(_LINKAGE))
+            logger.debug('mastery: injector reloaded on SF_LOBBY init')
+        except Exception:
+            logger.exception('mastery: failed to reload injector on SF_LOBBY init')
 
     @staticmethod
     def _isAccount():
         return isinstance(BigWorld.player(), PlayerAccount)
 
     def _onAccountShowGUI(self, _=None):
+        dbid = _getActiveAccountDBID()
+        if dbid:
+            self._ctrl.setActiveAccount(dbid)
         self._ctrl.enable()
 
     def _onAvatarBecomePlayer(self):
+        self._snapshotBaselineForBattle()
         self._ctrl.disable()
 
     def _onAccountBecomeNonPlayer(self):
@@ -1221,6 +1519,40 @@ class _Mod(object):
 
     def _onDisconnected(self):
         self._ctrl.disable()
+        self._session.reset()
+        self._ctrl.clearActiveAccount()
+
+    def _snapshotBaselineForBattle(self):
+        try:
+            player = BigWorld.player()
+        except Exception:
+            return
+        tankID = None
+        try:
+            descr = getattr(player, 'vehicleTypeDescriptor', None)
+            if descr is not None:
+                tankID = int(descr.type.compactDescr)
+        except Exception:
+            tankID = None
+        if tankID is None:
+            try:
+                arena = getattr(player, 'arena', None)
+                pvid = int(getattr(player, 'playerVehicleID', 0) or 0)
+                if arena is not None and pvid:
+                    vInfo = arena.vehicles.get(pvid)
+                    if vInfo is not None:
+                        tankID = int(vInfo['vehicleType'].compactDescr)
+            except Exception:
+                tankID = None
+        if tankID is None:
+            return
+        baseline = self._ctrl._getLastKnownMark(tankID)
+        if baseline is None:
+            baseline = _readMarkForTankID(tankID)
+        if baseline is None:
+            logger.debug('session: no baseline mark for tankID=%s, skipping snapshot', tankID)
+            return
+        self._session.snapshotBeforeBattle(tankID, baseline)
 
 
 _g_mod = _Mod()
