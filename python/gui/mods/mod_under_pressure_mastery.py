@@ -425,9 +425,7 @@ class MasteryController(object):
         self._moeCacheTs    = {}
         self._pendingXp     = set()
         self._pendingMoe    = set()
-        # Per-account history: {accountDBID: {tankID: [entry_dict, ...]}}
         self._markHistory   = {}
-        # Per-account last known mark: {accountDBID: {tankID: float}}
         self._lastKnownMark = {}
         self._currentAccountDBID = 0
         self._saveRev       = 0
@@ -480,12 +478,6 @@ class MasteryController(object):
             return
         self._enabled = True
         self._visibleByData = False
-        # _g_controller is bound permanently in _Mod.__init__ to survive
-        # SF lobby app recreation on relogin/server change. Do NOT wipe
-        # _injectorView/_panelReady here: the view may have been (re)created
-        # already via AppLifeCycleEvent.INITIALIZED before enable() runs.
-        # Clearing is handled by _onInjectorDisposed when the view actually
-        # goes away.
         g_currentVehicle.onChanged += self._onVehicleChanged
         try:
             ServicesLocator.settingsCore.interfaceScale.onScaleChanged += self._onScaleChanged
@@ -528,12 +520,6 @@ class MasteryController(object):
                 lsm.onVisibleRouteChanged -= self._onVisibleRouteChanged
             except Exception:
                 pass
-        # Do NOT null _g_controller, _injectorView or _panelReady here:
-        # _g_controller is bound permanently in _Mod.__init__ so the injector
-        # view recreated on relogin can still find us. _injectorView lifecycle
-        # is handled by _onInjectorDisposed when the view actually goes away
-        # (SF lobby app teardown). Nulling here would lose the fresh view that
-        # AppLifeCycleEvent.INITIALIZED pre-loads before enable() runs again.
         if self._panelReady and self._injectorView is not None:
             try:
                 self._injectorView.flashObject.as_setVisible(False)
@@ -738,8 +724,6 @@ class MasteryController(object):
                                  version, len(self._xpCache), len(self._moeCache),
                                  self._viewMode, self._position, len(self._markHistory))
                 else:
-                    # Migration: preserve API caches + position/mode, drop per-tank history
-                    # (old schema was not per-account, so it cannot be migrated safely).
                     self._xpCache    = cached.get('xp',    {}) or {}
                     self._moeCache   = cached.get('moe',   {}) or {}
                     self._xpCacheTs  = cached.get('xpTs',  {}) or {}
@@ -891,6 +875,10 @@ class MasteryController(object):
                 except (TypeError, ValueError):
                     continue
         current = self._getLastKnownMark(tankID)
+        if current is not None:
+            current_f = float(current)
+            if not values or abs(values[-1] - current_f) > 0.0001:
+                values.append(current_f)
         try:
             self._injectorView.flashObject.as_setBattleHistory(
                 values,
@@ -1420,11 +1408,6 @@ class _Mod(object):
         self._results = _BattleResultsCollector(self._ctrl)
         self._modalWatcher = _ModalWindowWatcher(self._ctrl)
         self._lobbyEventBound = False
-        # Bind controller to view class once and keep it bound: the SF lobby
-        # app is recreated on login <-> hangar transitions, and each re-init
-        # reloads the injector view. _populate() must find a controller to
-        # capture the new view reference — otherwise the panel does not
-        # reappear after a relogin or server change.
         MasteryPanelInjectorView._g_controller = self._ctrl
 
     def init(self):

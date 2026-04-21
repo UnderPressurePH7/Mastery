@@ -16,12 +16,6 @@ package com.under_pressure.mastery
 
     public class MasteryPanelComponent extends Sprite
     {
-        // View modes — cycle order: 0 → 1 → 2 → 3 → 4 → 0
-        // 0 = mastery + marks        (screenshot 2)
-        // 1 = mastery only           (screenshot 4)
-        // 2 = marks only             (screenshot 3)
-        // 3 = mastery + marks + graph(screenshot 5)
-        // 4 = marks + graph          (screenshot 1)
         public static const MODE_BOTH:int        = 0;
         public static const MODE_MASTERY:int     = 1;
         public static const MODE_MARKS:int       = 2;
@@ -148,8 +142,6 @@ package com.under_pressure.mastery
             _layout();
         }
 
-        // ── Public API ────────────────────────────────────────────────────
-
         public function setMasteryData(third:int, second:int, first:int, ace:int):void
         {
             if (_disposed) return;
@@ -178,7 +170,7 @@ package com.under_pressure.mastery
                     _battleHistory.push(Number(values[i]));
             }
             _currentMark = currentMark;
-            _hasGraph = (_battleHistory.length > 1);
+            _hasGraph = (_battleHistory.length >= 1);
             _layout();
         }
 
@@ -246,8 +238,6 @@ package com.under_pressure.mastery
             _teardownDragListeners();
             _clearDragTimeout();
         }
-
-        // ── Layout ────────────────────────────────────────────────────────
 
         private function _layout():void
         {
@@ -358,7 +348,6 @@ package com.under_pressure.mastery
             if (values.length == 0 && !isNaN(_currentMark))
                 values = [_currentMark];
 
-            // Dynamic Y scale
             var minV:Number = 0.0, maxV:Number = 100.0;
             if (values.length > 0)
             {
@@ -381,7 +370,6 @@ package com.under_pressure.mastery
             if (maxV > 100)  maxV = 100;
             if (maxV <= minV) maxV = minV + 6;
 
-            // Grid lines
             g.lineStyle(1, COLOR_GRID, 0.25);
             for (i = 0; i <= GRAPH_ROWS; i++)
             {
@@ -396,7 +384,6 @@ package com.under_pressure.mastery
                 g.lineTo(gx, bottom);
             }
 
-            // Y-axis labels (4 labels: top, 1/3, 2/3, bottom)
             for (i = 0; i < _axisLabels.length; i++)
             {
                 var labelTf:TextField = _axisLabels[i] as TextField;
@@ -410,7 +397,6 @@ package com.under_pressure.mastery
 
             if (values.length < 1) return;
 
-            // Build screen points
             var pts:Array = [];
             for (i = 0; i < values.length; i++)
             {
@@ -419,7 +405,6 @@ package com.under_pressure.mastery
                 pts.push(new Point(px, py));
             }
 
-            // Line
             if (pts.length > 1)
             {
                 g.lineStyle(2, COLOR_LINE, 0.95);
@@ -428,15 +413,12 @@ package com.under_pressure.mastery
                     g.lineTo(pts[i].x, pts[i].y);
             }
 
-            // Square dots per battle
             g.lineStyle(1, COLOR_DOT, 0.9);
             g.beginFill(COLOR_DOT, 0.95);
             for (i = 0; i < pts.length; i++)
                 g.drawRect(pts[i].x - 2.5, pts[i].y - 2.5, 5, 5);
             g.endFill();
         }
-
-        // ── Cell text ─────────────────────────────────────────────────────
 
         private function _xpCellText(i:int):String
         {
@@ -456,7 +438,6 @@ package com.under_pressure.mastery
             return _fmtNum(v);
         }
 
-        // ── Drawing ───────────────────────────────────────────────────────
 
         private function _drawBackground():void
         {
@@ -471,7 +452,6 @@ package com.under_pressure.mastery
             g.endFill();
         }
 
-        // ── Drag hit ──────────────────────────────────────────────────────
 
         private function _createDragHit():void
         {
@@ -490,8 +470,6 @@ package com.under_pressure.mastery
             _dragHit.graphics.drawRect(0, 0, _panelWidth, _panelHeight);
             _dragHit.graphics.endFill();
         }
-
-        // ── Listeners ────────────────────────────────────────────────────
 
         private function _setupDragListeners():void
         {
@@ -600,8 +578,6 @@ package com.under_pressure.mastery
             dispatchEvent(new MasteryPanelEvent(MasteryPanelEvent.VIEW_MODE_CHANGED, _viewMode));
         }
 
-        // ── Position ──────────────────────────────────────────────────────
-
         private function _clampToScreen(px:Number, py:Number):void
         {
             var sw:int = (stage != null && stage.stageWidth  > 0) ? stage.stageWidth  : 1920;
@@ -617,8 +593,6 @@ package com.under_pressure.mastery
             this.x = _reusablePoint.x;
             this.y = _reusablePoint.y;
         }
-
-        // ── Helpers ───────────────────────────────────────────────────────
 
         private function _createRowFields(count:int, autoSize:String, fontSize:int):Array
         {
