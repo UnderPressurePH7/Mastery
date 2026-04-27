@@ -60,6 +60,8 @@ package com.under_pressure.mastery
         private static const COLOR_LINE:uint    = 0xF1F1F1;
         private static const COLOR_AXIS:uint    = 0xA8B2BC;
         private static const COLOR_DOT:uint     = 0xFFFFFF;
+        private static const COLOR_LABEL:uint   = 0xFFFFFF;
+        private static const FONT_SIZE_LABEL:int = 11;
 
         private static const ICON_MASTERY_3RD:String = "img://gui/maps/icons/achievement/48x48/markOfMastery1.png";
         private static const ICON_MASTERY_2ND:String = "img://gui/maps/icons/achievement/48x48/markOfMastery2.png";
@@ -83,6 +85,7 @@ package com.under_pressure.mastery
         private var _moePercent:Array;
         private var _moeValue:Array;
         private var _axisLabels:Array;
+        private var _markLabel:TextField;
 
         private var _textShadow:DropShadowFilter;
         private var _matrix:Matrix;
@@ -136,6 +139,15 @@ package com.under_pressure.mastery
             _moePercent = _createRowFields(COL_COUNT, TextFieldAutoSize.LEFT, FONT_SIZE_PERCENT);
             _moeValue   = _createRowFields(COL_COUNT, TextFieldAutoSize.LEFT, FONT_SIZE_VALUE);
             _axisLabels = _createRowFields(4, TextFieldAutoSize.RIGHT, FONT_SIZE_AXIS);
+
+            _markLabel = new TextField();
+            _markLabel.selectable  = false;
+            _markLabel.mouseEnabled = false;
+            _markLabel.autoSize    = TextFieldAutoSize.LEFT;
+            _markLabel.multiline   = false;
+            _markLabel.filters     = [_textShadow];
+            _markLabel.visible     = false;
+            addChild(_markLabel);
 
             _createDragHit();
             _setupDragListeners();
@@ -281,6 +293,7 @@ package com.under_pressure.mastery
             {
                 _graphLayer.graphics.clear();
                 _hideRow(_axisLabels);
+                if (_markLabel) _markLabel.visible = false;
                 y += PAD_V;
             }
 
@@ -395,7 +408,11 @@ package com.under_pressure.mastery
                 labelTf.y = top + ratio * GRAPH_H - 8;
             }
 
-            if (values.length < 1) return;
+            if (values.length < 1)
+            {
+                if (_markLabel) _markLabel.visible = false;
+                return;
+            }
 
             var pts:Array = [];
             for (i = 0; i < values.length; i++)
@@ -418,6 +435,24 @@ package com.under_pressure.mastery
             for (i = 0; i < pts.length; i++)
                 g.drawRect(pts[i].x - 2.5, pts[i].y - 2.5, 5, 5);
             g.endFill();
+
+            // Draw current mark label next to the last point
+            var lastPt:Point = pts[pts.length - 1] as Point;
+            var labelVal:Number = !isNaN(_currentMark) ? _currentMark : Number(values[values.length - 1]);
+            var labelStr:String = labelVal.toFixed(2) + "%";
+            _markLabel.htmlText = _fmt(labelStr, FONT_SIZE_LABEL, COLOR_LABEL);
+            var labelX:Number = lastPt.x + 6;
+            var labelY:Number = lastPt.y - 8;
+            // Clamp so label stays inside panel
+            if (labelX + _markLabel.width > right)
+                labelX = lastPt.x - _markLabel.width - 6;
+            if (labelY < top)
+                labelY = top;
+            if (labelY + _markLabel.height > bottom)
+                labelY = bottom - _markLabel.height;
+            _markLabel.x = labelX;
+            _markLabel.y = labelY;
+            _markLabel.visible = true;
         }
 
         private function _xpCellText(i:int):String

@@ -227,32 +227,37 @@ def _safeFloat(value):
         return None
 
 
-def _readMarkPercent(vehicle):
+def _readMarkFromDossier(dossier, debug_tankID=None):
+    if dossier is None:
+        return None
+
+    for block_name in ('a15x15', 'total', 'a15x15_2', 'achievements', 'rated7x7'):
+        try:
+            block = dossier.getBlock(block_name)
+            if block is None:
+                continue
+            raw = block.get('damageRating')
+            if raw is not None:
+                number = _safeFloat(raw)
+                if number is not None and number > 0.0:
+                    # damageRating stored as int*100 (e.g. 6577 = 65.77%)
+                    result = number / 100.0
+                    if 0.0 < result <= 100.0:
+                        return round(result, 2)
+        except Exception:
+            pass
+
+    return None
+
+
+def _readMarkPercent(vehicle, debug_tankID=None):
     if vehicle is None:
         return None
-    candidates = []
-    for attr in ('marksOnGun', 'damageRating', 'movingAvgDamage'):
-        if hasattr(vehicle, attr):
-            candidates.append(getattr(vehicle, attr))
-    dossier = getattr(vehicle, 'publicInfo', None)
-    if dossier is not None:
-        for attr in ('marksOnGun', 'damageRating'):
-            if hasattr(dossier, attr):
-                candidates.append(getattr(dossier, attr))
-    descr = getattr(vehicle, 'descriptor', None)
-    if descr is not None:
-        for attr in ('marksOnGun', 'damageRating'):
-            if hasattr(descr, attr):
-                candidates.append(getattr(descr, attr))
-
-    for value in candidates:
-        number = _safeFloat(value)
-        if number is None:
-            continue
-        if 0.0 <= number <= 100.0:
-            return round(number, 2)
-        if 0.0 <= number <= 1.0:
-            return round(number * 100.0, 2)
+    try:
+        dossier = vehicle.getDossier()
+        return _readMarkFromDossier(dossier, debug_tankID=debug_tankID)
+    except Exception:
+        pass
     return None
 
 
@@ -260,18 +265,25 @@ def _readMarkForTankID(tankID):
     if tankID is None:
         return None
     try:
-        items = ServicesLocator.itemsCache.items
+        if g_currentVehicle.isPresent():
+            if getattr(g_currentVehicle.item, 'intCD', None) == tankID:
+                mark = _readMarkFromDossier(g_currentVehicle.getDossier(), debug_tankID=tankID)
+                if mark is not None:
+                    return mark
     except Exception:
-        return None
-    if items is None:
-        return None
+        pass
+    # Fallback: itemsCache vehicle item
     try:
-        vehicle = items.getItemByCD(int(tankID))
+        items = ServicesLocator.itemsCache.items
+        if items is not None:
+            vehicle = items.getItemByCD(int(tankID))
+            if vehicle is not None:
+                mark = _readMarkPercent(vehicle, debug_tankID=tankID)
+                if mark is not None:
+                    return mark
     except Exception:
-        return None
-    if vehicle is None:
-        return None
-    return _readMarkPercent(vehicle)
+        pass
+    return None
 
 
 def _getTankLevelByCD(compactDescr):
@@ -430,6 +442,7 @@ class MasteryController(object):
         self._currentAccountDBID = 0
         self._saveRev       = 0
         self._saveCallbackId = None
+        self._markRetryCallbackId = None
         self._loadCache()
 
     def setActiveAccount(self, accountDBID):
@@ -473,6 +486,51 @@ class MasteryController(object):
             bucket[tankID] = float(mark)
             self._scheduleSaveCache()
 
+    def _scheduleMarkRetry(self, attempt=0):
+        _cancelCallbackSafe(self._markRetryCallbackId)
+        if attempt >= 30:
+            logger.debug('mark retry: gave up after %d attempts', attempt)
+            return
+        # First few retries fast (0.3s), then slow down
+        if attempt < 5:
+            delay = 0.3
+        else:
+            delay = 0.5 + (attempt - 5) * 0.5
+        self._markRetryCallbackId = BigWorld.callback(
+            delay, lambda: self._markRetryTick(attempt + 1))
+
+    def _markRetryTick(self, attempt):
+        self._markRetryCallbackId = None
+        if not self._enabled:
+            return
+        if not g_currentVehicle.isPresent():
+            return
+        tankID = getattr(g_currentVehicle.item, 'intCD', None)
+        if tankID is None:
+            return
+        mark = self._readLiveMarkForTank(tankID)
+        if mark is None:
+            logger.debug('mark retry: attempt %d, still no mark for tankID=%s', attempt, tankID)
+            self._scheduleMarkRetry(attempt)
+            return
+        logger.debug('mark retry: got mark=%.2f for tankID=%s on attempt %d', mark, tankID, attempt)
+        prev = self._getLastKnownMark(tankID)
+        self._setLastKnownMark(tankID, mark)
+        self._refresh()
+        # Keep retrying for a short while after battle so we catch the dossier update.
+        # Stop after attempt 8 (covers ~2.4s of fast retries) if value is stable.
+        if attempt < 8:
+            self._scheduleMarkRetry(attempt)
+
+    def _onItemsCacheSynced(self, *_):
+        try:
+            ServicesLocator.itemsCache.onSyncCompleted -= self._onItemsCacheSynced
+        except Exception:
+            pass
+        logger.debug('itemsCache synced, refreshing mark')
+        self._captureCurrentMarkSample()
+        self._refresh()
+
     def enable(self):
         if self._enabled:
             return
@@ -498,6 +556,15 @@ class MasteryController(object):
                 self._injectFlash()
             else:
                 self._refresh()
+        # Always schedule a deferred mark capture — getDossier() may return
+        # stale data immediately after returning from battle even if isSynced()
+        # Subscribe to onSyncCompleted as well in case cache isn't ready yet
+        try:
+            if not ServicesLocator.itemsCache.isSynced():
+                ServicesLocator.itemsCache.onSyncCompleted += self._onItemsCacheSynced
+        except Exception:
+            pass
+        self._scheduleMarkRetry()
         logger.debug('enabled, hangarVisible=%s', self._hangarVisible)
 
     def disable(self):
@@ -508,6 +575,12 @@ class MasteryController(object):
             g_currentVehicle.onChanged -= self._onVehicleChanged
         except Exception:
             pass
+        try:
+            ServicesLocator.itemsCache.onSyncCompleted -= self._onItemsCacheSynced
+        except Exception:
+            pass
+        _cancelCallbackSafe(self._markRetryCallbackId)
+        self._markRetryCallbackId = None
         if self._scaleBound:
             try:
                 ServicesLocator.settingsCore.interfaceScale.onScaleChanged -= self._onScaleChanged
@@ -578,17 +651,45 @@ class MasteryController(object):
         self._captureCurrentMarkSample()
         self._refresh()
 
-    def _captureCurrentMarkSample(self):
-        if not g_currentVehicle.isPresent():
-            return
-        vehicle = g_currentVehicle.item
-        tankID = getattr(vehicle, 'intCD', None)
+    def _readLiveMarkForTank(self, tankID):
         if tankID is None:
-            return
-        mark = _readMarkPercent(vehicle)
-        if mark is None:
-            return
-        self._setLastKnownMark(tankID, mark)
+            return None
+        try:
+            if g_currentVehicle.isPresent():
+                if getattr(g_currentVehicle.item, 'intCD', None) == tankID:
+                    mark = _readMarkFromDossier(g_currentVehicle.getDossier(), debug_tankID=tankID)
+                    if mark is not None:
+                        return mark
+        except Exception:
+            logger.exception('livefix: g_currentVehicle.getDossier() failed')
+
+        # Fallback: itemsCache vehicle item dossier
+        try:
+            mark = _readMarkForTankID(tankID)
+            if mark is not None:
+                return mark
+        except Exception:
+            logger.exception('livefix: itemsCache mark read failed')
+
+        return None
+
+    def _captureCurrentMarkSample(self):
+        try:
+            if not g_currentVehicle.isPresent():
+                return
+            vehicle = g_currentVehicle.item
+            tankID = getattr(vehicle, 'intCD', None)
+            if tankID is None:
+                return
+            mark = self._readLiveMarkForTank(tankID)
+            if mark is None:
+                self._scheduleMarkRetry()
+                return
+            _cancelCallbackSafe(self._markRetryCallbackId)
+            self._markRetryCallbackId = None
+            self._setLastKnownMark(tankID, mark)
+        except Exception:
+            logger.exception('livefix: capture current mark failed')
 
     def _onBattleProcessed(self, tankID, newMark, mapName=None):
         try:
@@ -861,8 +962,13 @@ class MasteryController(object):
     def _pushHistory(self, tankID):
         if not self._injectorView:
             return
-        history = self._getHistoryForTank(tankID)[-_MAX_HISTORY:]
+
         values = []
+        try:
+            history = self._getHistoryForTank(tankID)[-_MAX_HISTORY:]
+        except Exception:
+            history = []
+
         for entry in history:
             if isinstance(entry, dict):
                 try:
@@ -874,11 +980,24 @@ class MasteryController(object):
                     values.append(float(entry))
                 except (TypeError, ValueError):
                     continue
-        current = self._getLastKnownMark(tankID)
+
+        # Main fix: prefer the live/current percentage from the tank.
+        current = self._readLiveMarkForTank(tankID)
+
+        # Fallback: use previously saved value only if live read is unavailable.
+        if current is None:
+            current = self._getLastKnownMark(tankID)
+
         if current is not None:
-            current_f = float(current)
-            if not values or abs(values[-1] - current_f) > 0.0001:
-                values.append(current_f)
+            try:
+                current_f = float(current)
+                self._setLastKnownMark(tankID, current_f)
+                if not values or abs(values[-1] - current_f) > 0.0001:
+                    values.append(current_f)
+                current = current_f
+            except (TypeError, ValueError):
+                current = None
+
         try:
             self._injectorView.flashObject.as_setBattleHistory(
                 values,
