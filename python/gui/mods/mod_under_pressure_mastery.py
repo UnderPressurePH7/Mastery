@@ -110,7 +110,7 @@ _INJECT_MAX_ATTEMPTS = 30
 _API_TIMEOUT = 5.0
 _API_MAX_ATTEMPTS = 3
 _API_RETRY_BASE_DELAY = 2.0
-_MAX_HISTORY = 100
+_MAX_HISTORY = 50
 _MIN_TANK_LEVEL = 5
 _DEFAULT_VIEW_MODE = 0
 
@@ -240,7 +240,6 @@ def _readMarkFromDossier(dossier, debug_tankID=None):
             if raw is not None:
                 number = _safeFloat(raw)
                 if number is not None and number > 0.0:
-                    # damageRating stored as int*100 (e.g. 6577 = 65.77%)
                     result = number / 100.0
                     if 0.0 < result <= 100.0:
                         return round(result, 2)
@@ -272,7 +271,6 @@ def _readMarkForTankID(tankID):
                     return mark
     except Exception:
         pass
-    # Fallback: itemsCache vehicle item
     try:
         items = ServicesLocator.itemsCache.items
         if items is not None:
@@ -491,7 +489,6 @@ class MasteryController(object):
         if attempt >= 30:
             logger.debug('mark retry: gave up after %d attempts', attempt)
             return
-        # First few retries fast (0.3s), then slow down
         if attempt < 5:
             delay = 0.3
         else:
@@ -517,8 +514,6 @@ class MasteryController(object):
         prev = self._getLastKnownMark(tankID)
         self._setLastKnownMark(tankID, mark)
         self._refresh()
-        # Keep retrying for a short while after battle so we catch the dossier update.
-        # Stop after attempt 8 (covers ~2.4s of fast retries) if value is stable.
         if attempt < 8:
             self._scheduleMarkRetry(attempt)
 
@@ -556,9 +551,6 @@ class MasteryController(object):
                 self._injectFlash()
             else:
                 self._refresh()
-        # Always schedule a deferred mark capture — getDossier() may return
-        # stale data immediately after returning from battle even if isSynced()
-        # Subscribe to onSyncCompleted as well in case cache isn't ready yet
         try:
             if not ServicesLocator.itemsCache.isSynced():
                 ServicesLocator.itemsCache.onSyncCompleted += self._onItemsCacheSynced
@@ -654,6 +646,7 @@ class MasteryController(object):
     def _readLiveMarkForTank(self, tankID):
         if tankID is None:
             return None
+
         try:
             if g_currentVehicle.isPresent():
                 if getattr(g_currentVehicle.item, 'intCD', None) == tankID:
@@ -663,7 +656,6 @@ class MasteryController(object):
         except Exception:
             logger.exception('livefix: g_currentVehicle.getDossier() failed')
 
-        # Fallback: itemsCache vehicle item dossier
         try:
             mark = _readMarkForTankID(tankID)
             if mark is not None:
@@ -981,10 +973,8 @@ class MasteryController(object):
                 except (TypeError, ValueError):
                     continue
 
-        # Main fix: prefer the live/current percentage from the tank.
         current = self._readLiveMarkForTank(tankID)
 
-        # Fallback: use previously saved value only if live read is unavailable.
         if current is None:
             current = self._getLastKnownMark(tankID)
 

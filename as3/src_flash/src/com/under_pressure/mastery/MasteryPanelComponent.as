@@ -24,9 +24,9 @@ package com.under_pressure.mastery
         private static const VIEW_MODES:Array = [MODE_BOTH, MODE_MASTERY, MODE_MARKS, MODE_BOTH_GRAPH, MODE_MARKS_GRAPH];
 
         private static const PAD_H:int        = 12;
-        private static const PAD_V:int        = 8;
-        private static const ROW_HEIGHT:int   = 22;
-        private static const ROW_GAP:int      = 2;
+        private static const PAD_V:int        = 6;
+        private static const ROW_HEIGHT:int   = 20;
+        private static const ROW_GAP:int      = 1;
         private static const COL_COUNT:int    = 4;
         private static const COL_GAP:int      = 18;
         private static const ICON_W:int       = 24;
@@ -350,6 +350,7 @@ package com.under_pressure.mastery
             var g:Graphics = _graphLayer.graphics;
             g.clear();
 
+            var i:int;
             var left:Number   = PAD_H + GRAPH_LEFT;
             var top:Number    = topY;
             var right:Number  = left + GRAPH_W;
@@ -361,52 +362,28 @@ package com.under_pressure.mastery
             if (values.length == 0 && !isNaN(_currentMark))
                 values = [_currentMark];
 
-            var minV:Number = 0.0, maxV:Number = 100.0;
-            if (values.length > 0)
-            {
-                minV = maxV = Number(values[0]);
-                for (var i:int = 1; i < values.length; i++)
-                {
-                    if (Number(values[i]) < minV) minV = Number(values[i]);
-                    if (Number(values[i]) > maxV) maxV = Number(values[i]);
-                }
-            }
-            minV = Math.floor(minV) - 1;
-            maxV = Math.ceil(maxV)  + 1;
-            if (maxV - minV < 6)
-            {
-                var center:Number = (maxV + minV) * 0.5;
-                minV = Math.floor(center - 3);
-                maxV = Math.ceil(center + 3);
-            }
-            if (minV < 0)    minV = 0;
-            if (maxV > 100)  maxV = 100;
-            if (maxV <= minV) maxV = minV + 6;
-
-            g.lineStyle(1, COLOR_GRID, 0.25);
             for (i = 0; i <= GRAPH_ROWS; i++)
             {
                 var gy:Number = top + i * rowStep;
-                g.moveTo(left, gy);
-                g.lineTo(right, gy);
+                if (i == GRAPH_ROWS)
+                {
+                    g.lineStyle(0.5, COLOR_GRID, 0.22);
+                    g.moveTo(left, gy);
+                    g.lineTo(right, gy);
+                }
+                else
+                {
+                    g.lineStyle(0.5, COLOR_GRID, 0.08);
+                    var dashX:Number = left;
+                    while (dashX + 2 < right)
+                    {
+                        g.moveTo(dashX, gy);
+                        g.lineTo(dashX + 2, gy);
+                        dashX += 5;
+                    }
+                }
             }
-            for (i = 0; i <= GRAPH_COLS; i++)
-            {
-                var gx:Number = left + i * colStep;
-                g.moveTo(gx, top);
-                g.lineTo(gx, bottom);
-            }
-
-            for (i = 0; i < _axisLabels.length; i++)
-            {
-                var labelTf:TextField = _axisLabels[i] as TextField;
-                labelTf.visible = true;
-                var ratio:Number = Number(i) / Number(_axisLabels.length - 1);
-                var labelVal:Number = maxV - (maxV - minV) * ratio;
-                labelTf.htmlText = _fmt(int(Math.round(labelVal)).toString() + "%", FONT_SIZE_AXIS, COLOR_AXIS);
-                labelTf.x = PAD_H + GRAPH_LEFT - 4;
-                labelTf.y = top + ratio * GRAPH_H - 8;
-            }
+            g.lineStyle(NaN);
 
             if (values.length < 1)
             {
@@ -414,42 +391,175 @@ package com.under_pressure.mastery
                 return;
             }
 
-            var pts:Array = [];
+            var PILL_RESERVE:Number = 38;
+            var WINDOW:int = 10;
+            var AXIS_STEP:Number = 2.0;
+            var AXIS_ROWS:int   = 4;
+
+            var currentVal:Number = !isNaN(_currentMark) ? _currentMark : Number(values[values.length - 1]);
+            var axisBot:Number = Math.floor(currentVal / AXIS_STEP) * AXIS_STEP - AXIS_STEP;
+            var axisTop:Number = axisBot + AXIS_ROWS * AXIS_STEP;
+            if (axisBot < 0)  { axisBot = 0;   axisTop = AXIS_ROWS * AXIS_STEP; }
+            if (axisTop > 100) { axisTop = 100; axisBot = 100 - AXIS_ROWS * AXIS_STEP; }
+            var dynRange:Number = axisTop - axisBot;
+            var inRange:Array = [];
             for (i = 0; i < values.length; i++)
             {
-                var px:Number = left + colStep * 0.5 + i * colStep;
-                var py:Number = bottom - ((Number(values[i]) - minV) / (maxV - minV)) * GRAPH_H;
+                var val:Number = Number(values[i]);
+                if (val >= axisBot && val <= axisTop)
+                    inRange.push(val);
+            }
+            if (inRange.length == 0)
+                inRange.push(currentVal);
+            var winValues:Array = inRange.length > WINDOW
+                ? inRange.slice(inRange.length - WINDOW)
+                : inRange;
+
+            var winCount:int = winValues.length;
+            var LEFT_PAD:Number = 28;
+            var filtStep:Number = winCount > 1
+                ? (GRAPH_W - PILL_RESERVE - LEFT_PAD) / (winCount - 1)
+                : 0;
+
+            var pts:Array = [];
+            for (i = 0; i < winCount; i++)
+            {
+                var fv:Number = Number(winValues[i]);
+                var px:Number = winCount > 1
+                    ? left + LEFT_PAD + i * filtStep
+                    : left + (GRAPH_W - PILL_RESERVE);
+                var rawPy:Number = bottom - ((fv - axisBot) / dynRange) * GRAPH_H;
+                var py:Number = Math.max(top, Math.min(bottom, rawPy));
                 pts.push(new Point(px, py));
             }
-
-            if (pts.length > 1)
+            var actualRows:int = int((axisTop - axisBot) / AXIS_STEP);
+            var labelStep:int = Math.ceil(actualRows / AXIS_ROWS);
+            if (labelStep < 1) labelStep = 1;
+            var labelIdx:int = 0;
+            for (i = 0; i <= actualRows; i++)
             {
-                g.lineStyle(2, COLOR_LINE, 0.95);
+                if (i % labelStep != 0 && i != actualRows) continue;
+                if (labelIdx >= _axisLabels.length) break;
+                var axisVal:Number = axisBot + i * AXIS_STEP;
+                var labelTf2:TextField = _axisLabels[_axisLabels.length - 1 - labelIdx] as TextField;
+                if (labelTf2)
+                {
+                    labelTf2.visible = true;
+                    labelTf2.htmlText = _fmt(int(Math.round(axisVal)).toString() + "%", FONT_SIZE_AXIS, COLOR_AXIS);
+                    labelTf2.x = PAD_H + GRAPH_LEFT - 4;
+                    labelTf2.y = bottom - (i / actualRows) * GRAPH_H - 8;
+                }
+                labelIdx++;
+            }
+            for (i = labelIdx; i < _axisLabels.length; i++)
+            {
+                var hideTf:TextField = _axisLabels[i] as TextField;
+                if (hideTf) hideTf.visible = false;
+            }
+            if (pts.length >= 2)
+            {
+                g.endFill();
+                var areaAlphas:Array  = [0.12, 0.0];
+                var areaColors:Array  = [COLOR_LINE, COLOR_LINE];
+                var areaRatios:Array  = [0, 255];
+                var areaMatrix:Matrix = new Matrix();
+                areaMatrix.createGradientBox(GRAPH_W, GRAPH_H, Math.PI / 2, left, top);
+                g.beginGradientFill(GradientType.LINEAR, areaColors, areaAlphas, areaRatios, areaMatrix);
                 g.moveTo(pts[0].x, pts[0].y);
-                for (i = 1; i < pts.length; i++)
-                    g.lineTo(pts[i].x, pts[i].y);
+                var midX:Number = (pts[0].x + pts[1].x) * 0.5;
+                var midY:Number = (pts[0].y + pts[1].y) * 0.5;
+                g.lineTo(midX, midY);
+                for (i = 1; i < pts.length - 1; i++)
+                {
+                    var nextMidX:Number = (pts[i].x + pts[i+1].x) * 0.5;
+                    var nextMidY:Number = (pts[i].y + pts[i+1].y) * 0.5;
+                    g.curveTo(pts[i].x, pts[i].y, nextMidX, nextMidY);
+                }
+                g.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+                g.lineTo(pts[pts.length - 1].x, bottom);
+                g.lineTo(pts[0].x, bottom);
+                g.endFill();
+
+                g.lineStyle(1.5, COLOR_LINE, 0.95);
+                g.moveTo(pts[0].x, pts[0].y);
+                midX = (pts[0].x + pts[1].x) * 0.5;
+                midY = (pts[0].y + pts[1].y) * 0.5;
+                g.lineTo(midX, midY);
+                for (i = 1; i < pts.length - 1; i++)
+                {
+                    nextMidX = (pts[i].x + pts[i+1].x) * 0.5;
+                    nextMidY = (pts[i].y + pts[i+1].y) * 0.5;
+                    g.curveTo(pts[i].x, pts[i].y, nextMidX, nextMidY);
+                }
+                g.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+                g.endFill();
+                g.lineStyle(NaN);
             }
 
-            g.lineStyle(1, COLOR_DOT, 0.9);
+            for (i = 0; i < pts.length - 1; i++)
+            {
+                g.lineStyle(NaN);
+                g.beginFill(COLOR_DOT, 0.7);
+                g.drawCircle(pts[i].x, pts[i].y, 2);
+                g.endFill();
+            }
+
+            var lastPt:Point = pts[pts.length - 1] as Point;
+            g.lineStyle(1, COLOR_DOT, 0.3);
+            g.beginFill(0x000000, 0);
+            g.drawCircle(lastPt.x, lastPt.y, 5);
+            g.endFill();
+            g.lineStyle(0);
             g.beginFill(COLOR_DOT, 0.95);
-            for (i = 0; i < pts.length; i++)
-                g.drawRect(pts[i].x - 2.5, pts[i].y - 2.5, 5, 5);
+            g.drawCircle(lastPt.x, lastPt.y, 2.5);
             g.endFill();
 
-            // Draw current mark label next to the last point
-            var lastPt:Point = pts[pts.length - 1] as Point;
+            var dashH:Number = 4;
+            var gapH:Number  = 3;
+            var dashY:Number = lastPt.y + 4;
+            g.lineStyle(0.5, COLOR_DOT, 0.2);
+            while (dashY + dashH < bottom)
+            {
+                g.moveTo(lastPt.x, dashY);
+                g.lineTo(lastPt.x, dashY + dashH);
+                dashY += dashH + gapH;
+            }
+
             var labelVal:Number = !isNaN(_currentMark) ? _currentMark : Number(values[values.length - 1]);
             var labelStr:String = labelVal.toFixed(2) + "%";
             _markLabel.htmlText = _fmt(labelStr, FONT_SIZE_LABEL, COLOR_LABEL);
-            var labelX:Number = lastPt.x + 6;
-            var labelY:Number = lastPt.y - 8;
-            // Clamp so label stays inside panel
-            if (labelX + _markLabel.width > right)
-                labelX = lastPt.x - _markLabel.width - 6;
-            if (labelY < top)
-                labelY = top;
-            if (labelY + _markLabel.height > bottom)
-                labelY = bottom - _markLabel.height;
+
+            var calloutEndX:Number = lastPt.x + 14;
+            var calloutEndY:Number = lastPt.y - 14;
+            if (calloutEndY < top + 2) calloutEndY = top + 2;
+
+            var labelX:Number = calloutEndX + 2;
+            var labelY:Number = calloutEndY - _markLabel.height * 0.5;
+
+            if (labelX + _markLabel.width + 8 > right)
+            {
+                calloutEndX = lastPt.x - 14;
+                calloutEndY = lastPt.y - 14;
+                labelX = calloutEndX - _markLabel.width - 8;
+            }
+            if (labelY < top) labelY = top;
+            if (labelY + _markLabel.height > bottom) labelY = bottom - _markLabel.height;
+
+            g.lineStyle(0.75, COLOR_DOT, 0.35);
+            g.moveTo(lastPt.x + 2, lastPt.y - 2);
+            g.lineTo(calloutEndX, calloutEndY);
+
+            var pillPad:Number = 3;
+            var pillW:Number   = _markLabel.width + pillPad * 2;
+            var pillH:Number   = _markLabel.height;
+            var pillX:Number   = labelX - pillPad;
+            var pillY:Number   = labelY;
+            var pillR:Number   = pillH * 0.5;
+            g.lineStyle(0.75, 0xC8B97A, 0.4);
+            g.beginFill(0x0A0E12, 0.93);
+            g.drawRoundRect(pillX, pillY, pillW, pillH, pillR * 2, pillR * 2);
+            g.endFill();
+
             _markLabel.x = labelX;
             _markLabel.y = labelY;
             _markLabel.visible = true;
